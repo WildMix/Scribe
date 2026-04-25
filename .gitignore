@@ -1,3 +1,9 @@
-build/
-.idea/
-vendor/
+/build/
+/build-*/
+/.idea/
+/adapter-state/
+/objects/
+/refs/
+/HEAD
+/config
+/log
