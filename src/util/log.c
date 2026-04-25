@@ -1,144 +1,104 @@
-/*
- * Scribe - A protocol for Verifiable Data Lineage
- * util/log.c - Logging utilities
- */
+#include "util/log.h"
 
-#include <stdio.h>
+#include "core/internal.h"
+#include "util/error.h"
+
 #include <stdarg.h>
-#include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-/* Log levels */
-typedef enum {
-    LOG_DEBUG = 0,
-    LOG_INFO = 1,
-    LOG_WARN = 2,
-    LOG_ERROR = 3
-} scribe_log_level_t;
+static scribe_log_level g_min_level = SCRIBE_LOG_INFO;
 
-/* Current log level (can be set via environment or API) */
-static scribe_log_level_t current_level = LOG_INFO;
-
-/* ANSI color codes */
-#define COLOR_RESET   "\033[0m"
-#define COLOR_RED     "\033[31m"
-#define COLOR_GREEN   "\033[32m"
-#define COLOR_YELLOW  "\033[33m"
-#define COLOR_BLUE    "\033[34m"
-#define COLOR_GRAY    "\033[90m"
-
-static int use_colors = 1;
-
-void scribe_log_set_level(scribe_log_level_t level)
-{
-    current_level = level;
-}
-
-void scribe_log_set_colors(int enable)
-{
-    use_colors = enable;
-}
-
-static const char *level_string(scribe_log_level_t level)
-{
+static const char *level_name(scribe_log_level level) {
     switch (level) {
-        case LOG_DEBUG: return "DEBUG";
-        case LOG_INFO:  return "INFO";
-        case LOG_WARN:  return "WARN";
-        case LOG_ERROR: return "ERROR";
-        default:        return "?????";
+    case SCRIBE_LOG_DEBUG:
+        return "DEBUG";
+    case SCRIBE_LOG_INFO:
+        return "INFO";
+    case SCRIBE_LOG_WARN:
+        return "WARN";
+    case SCRIBE_LOG_ERROR:
+        return "ERROR";
+    default:
+        return "ERROR";
     }
 }
 
-static const char *level_color(scribe_log_level_t level)
-{
-    if (!use_colors) return "";
-    switch (level) {
-        case LOG_DEBUG: return COLOR_GRAY;
-        case LOG_INFO:  return COLOR_GREEN;
-        case LOG_WARN:  return COLOR_YELLOW;
-        case LOG_ERROR: return COLOR_RED;
-        default:        return "";
+scribe_error_t scribe_log_configure_from_env(void) {
+    const char *level = getenv("SCRIBE_LOG_LEVEL");
+
+    if (level == NULL || level[0] == '\0') {
+        g_min_level = SCRIBE_LOG_INFO;
+        return SCRIBE_OK;
+    }
+    if (strcmp(level, "DEBUG") == 0) {
+        g_min_level = SCRIBE_LOG_DEBUG;
+    } else if (strcmp(level, "INFO") == 0) {
+        g_min_level = SCRIBE_LOG_INFO;
+    } else if (strcmp(level, "WARN") == 0) {
+        g_min_level = SCRIBE_LOG_WARN;
+    } else if (strcmp(level, "ERROR") == 0) {
+        g_min_level = SCRIBE_LOG_ERROR;
+    } else {
+        return scribe_set_error(SCRIBE_ECONFIG, "unknown SCRIBE_LOG_LEVEL '%s'", level);
+    }
+    return SCRIBE_OK;
+}
+
+scribe_error_t scribe_log_open(scribe_ctx *ctx) {
+    char *path;
+
+    if (ctx == NULL || ctx->repo_path == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid logger context");
+    }
+    path = scribe_path_join(ctx->repo_path, "log");
+    if (path == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    ctx->log_file = fopen(path, "ab");
+    free(path);
+    if (ctx->log_file == NULL) {
+        return scribe_set_error(SCRIBE_EIO, "failed to open .scribe/log");
+    }
+    return SCRIBE_OK;
+}
+
+void scribe_log_close(scribe_ctx *ctx) {
+    if (ctx != NULL && ctx->log_file != NULL) {
+        fclose(ctx->log_file);
+        ctx->log_file = NULL;
     }
 }
 
-static void scribe_log_impl(scribe_log_level_t level, const char *fmt, va_list args)
-{
-    if (level < current_level) return;
+void scribe_log_msg(scribe_ctx *ctx, scribe_log_level level, const char *component, const char *fmt, ...) {
+    char ts[32];
+    char message[768];
+    time_t now;
+    struct tm tm_utc;
+    va_list ap;
 
-    FILE *out = (level >= LOG_WARN) ? stderr : stdout;
+    if (level < g_min_level) {
+        return;
+    }
+    now = time(NULL);
+    if (gmtime_r(&now, &tm_utc) == NULL || strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc) == 0) {
+        strcpy(ts, "1970-01-01T00:00:00Z");
+    }
 
-    /* Timestamp */
-    time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    char time_buf[20];
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+    va_start(ap, fmt);
+    (void)vsnprintf(message, sizeof(message), fmt, ap);
+    va_end(ap);
 
-    /* Print log line */
-    fprintf(out, "%s[%s]%s %s%s%s: ",
-            use_colors ? COLOR_GRAY : "",
-            time_buf,
-            use_colors ? COLOR_RESET : "",
-            level_color(level),
-            level_string(level),
-            use_colors ? COLOR_RESET : "");
-
-    vfprintf(out, fmt, args);
-    fprintf(out, "\n");
-    fflush(out);
+    fprintf(stderr, "%s %s %s %s\n", ts, level_name(level), component, message);
+    if (ctx != NULL && ctx->log_file != NULL) {
+        fprintf(ctx->log_file, "%s %s %s %s\n", ts, level_name(level), component, message);
+    }
 }
 
-void scribe_log_debug(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    scribe_log_impl(LOG_DEBUG, fmt, args);
-    va_end(args);
-}
-
-void scribe_log_info(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    scribe_log_impl(LOG_INFO, fmt, args);
-    va_end(args);
-}
-
-void scribe_log_warn(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    scribe_log_impl(LOG_WARN, fmt, args);
-    va_end(args);
-}
-
-void scribe_log_error(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    scribe_log_impl(LOG_ERROR, fmt, args);
-    va_end(args);
-}
-
-/* Simple output without timestamp (for CLI output) */
-void scribe_print(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    vprintf(fmt, args);
-    va_end(args);
-    printf("\n");
-}
-
-void scribe_print_error(const char *fmt, ...)
-{
-    if (use_colors) fprintf(stderr, COLOR_RED);
-    fprintf(stderr, "error: ");
-    if (use_colors) fprintf(stderr, COLOR_RESET);
-
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
-    va_end(args);
-    fprintf(stderr, "\n");
+void scribe_log_flush(scribe_ctx *ctx) {
+    if (ctx != NULL && ctx->log_file != NULL) {
+        fflush(ctx->log_file);
+    }
 }
