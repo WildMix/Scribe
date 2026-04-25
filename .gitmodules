@@ -1,0 +1,9 @@
+[submodule "vendor/blake3"]
+	path = vendor/blake3
+	url = https://github.com/BLAKE3-team/BLAKE3.git
+[submodule "vendor/zstd"]
+	path = vendor/zstd
+	url = https://github.com/facebook/zstd.git
+[submodule "vendor/unity"]
+	path = vendor/unity
+	url = https://github.com/ThrowTheSwitch/Unity.git

@@ -1,0 +1,415 @@
+#include "core/internal.h"
+
+#include "util/error.h"
+#include "util/hex.h"
+#include "util/log.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct tree_node tree_node;
+
+typedef struct {
+    char *name;
+    uint8_t type;
+    uint8_t hash[SCRIBE_HASH_SIZE];
+    tree_node *child;
+} node_entry;
+
+struct tree_node {
+    node_entry *entries;
+    size_t count;
+    size_t cap;
+};
+
+static tree_node *node_new(scribe_arena *arena) {
+    tree_node *node = (tree_node *)scribe_arena_alloc(arena, sizeof(*node), _Alignof(tree_node));
+    if (node != NULL) {
+        memset(node, 0, sizeof(*node));
+    }
+    return node;
+}
+
+static ssize_t node_find(tree_node *node, const char *name) {
+    size_t i;
+
+    for (i = 0; i < node->count; i++) {
+        if (strcmp(node->entries[i].name, name) == 0) {
+            return (ssize_t)i;
+        }
+    }
+    return -1;
+}
+
+static scribe_error_t node_reserve(scribe_arena *arena, tree_node *node) {
+    node_entry *grown;
+    size_t new_cap;
+
+    if (node->count < node->cap) {
+        return SCRIBE_OK;
+    }
+    new_cap = node->cap == 0 ? 8u : node->cap * 2u;
+    grown = (node_entry *)scribe_arena_alloc(arena, sizeof(*grown) * new_cap, _Alignof(node_entry));
+    if (grown == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    if (node->count != 0) {
+        memcpy(grown, node->entries, sizeof(*grown) * node->count);
+    }
+    node->entries = grown;
+    node->cap = new_cap;
+    return SCRIBE_OK;
+}
+
+static scribe_error_t node_set_tree(scribe_arena *arena, tree_node *node, const char *name, tree_node *child) {
+    ssize_t idx = node_find(node, name);
+
+    if (idx >= 0) {
+        node_entry *entry = &node->entries[(size_t)idx];
+        entry->type = SCRIBE_OBJECT_TREE;
+        entry->child = child;
+        memset(entry->hash, 0, SCRIBE_HASH_SIZE);
+        return SCRIBE_OK;
+    }
+    if (node_reserve(arena, node) != SCRIBE_OK) {
+        return SCRIBE_ENOMEM;
+    }
+    node->entries[node->count].name = scribe_arena_strdup(arena, name);
+    if (node->entries[node->count].name == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    node->entries[node->count].type = SCRIBE_OBJECT_TREE;
+    node->entries[node->count].child = child;
+    memset(node->entries[node->count].hash, 0, SCRIBE_HASH_SIZE);
+    node->count++;
+    return SCRIBE_OK;
+}
+
+static scribe_error_t node_set_blob(scribe_arena *arena, tree_node *node, const char *name,
+                                    const uint8_t hash[SCRIBE_HASH_SIZE]) {
+    ssize_t idx = node_find(node, name);
+
+    if (idx >= 0) {
+        node_entry *entry = &node->entries[(size_t)idx];
+        entry->type = SCRIBE_OBJECT_BLOB;
+        entry->child = NULL;
+        scribe_hash_copy(entry->hash, hash);
+        return SCRIBE_OK;
+    }
+    if (node_reserve(arena, node) != SCRIBE_OK) {
+        return SCRIBE_ENOMEM;
+    }
+    node->entries[node->count].name = scribe_arena_strdup(arena, name);
+    if (node->entries[node->count].name == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    node->entries[node->count].type = SCRIBE_OBJECT_BLOB;
+    scribe_hash_copy(node->entries[node->count].hash, hash);
+    node->entries[node->count].child = NULL;
+    node->count++;
+    return SCRIBE_OK;
+}
+
+static void node_delete(tree_node *node, const char *name) {
+    ssize_t idx = node_find(node, name);
+
+    if (idx < 0) {
+        return;
+    }
+    if ((size_t)idx + 1u < node->count) {
+        memmove(&node->entries[(size_t)idx], &node->entries[(size_t)idx + 1u],
+                sizeof(*node->entries) * (node->count - (size_t)idx - 1u));
+    }
+    node->count--;
+}
+
+static scribe_error_t load_tree(scribe_ctx *ctx, scribe_arena *work, const uint8_t hash[SCRIBE_HASH_SIZE],
+                                tree_node **out) {
+    scribe_object obj;
+    scribe_arena arena;
+    scribe_tree_entry *entries = NULL;
+    size_t count = 0;
+    size_t i;
+    tree_node *node;
+    scribe_error_t err;
+
+    err = scribe_object_read(ctx, hash, &obj);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    if (obj.type != SCRIBE_OBJECT_TREE) {
+        scribe_object_free(&obj);
+        return scribe_set_error(SCRIBE_ECORRUPT, "expected tree object");
+    }
+    err = scribe_arena_init(&arena, obj.payload_len + 1024u + (obj.payload_len / 8u));
+    if (err != SCRIBE_OK) {
+        scribe_object_free(&obj);
+        return err;
+    }
+    err = scribe_tree_parse(obj.payload, obj.payload_len, &arena, &entries, &count);
+    if (err != SCRIBE_OK) {
+        scribe_arena_destroy(&arena);
+        scribe_object_free(&obj);
+        return err;
+    }
+    node = node_new(work);
+    if (node == NULL) {
+        scribe_arena_destroy(&arena);
+        scribe_object_free(&obj);
+        return SCRIBE_ENOMEM;
+    }
+    for (i = 0; i < count; i++) {
+        if (entries[i].type == SCRIBE_OBJECT_TREE) {
+            tree_node *child = NULL;
+            err = load_tree(ctx, work, entries[i].hash, &child);
+            if (err != SCRIBE_OK) {
+                scribe_arena_destroy(&arena);
+                scribe_object_free(&obj);
+                return err;
+            }
+            err = node_set_tree(work, node, entries[i].name, child);
+        } else {
+            err = node_set_blob(work, node, entries[i].name, entries[i].hash);
+        }
+        if (err != SCRIBE_OK) {
+            scribe_arena_destroy(&arena);
+            scribe_object_free(&obj);
+            return err;
+        }
+    }
+    scribe_arena_destroy(&arena);
+    scribe_object_free(&obj);
+    *out = node;
+    return SCRIBE_OK;
+}
+
+static scribe_error_t apply_change(scribe_ctx *ctx, scribe_arena *work, tree_node *root,
+                                   const scribe_change_event *ev) {
+    tree_node *node = root;
+    size_t i;
+
+    for (i = 0; i + 1u < ev->path_len; i++) {
+        ssize_t idx = node_find(node, ev->path[i]);
+        tree_node *child;
+        if (idx >= 0 && node->entries[(size_t)idx].type != SCRIBE_OBJECT_TREE) {
+            return scribe_set_error(SCRIBE_ECORRUPT, "path component collides with blob");
+        }
+        if (idx >= 0) {
+            child = node->entries[(size_t)idx].child;
+        } else {
+            child = node_new(work);
+            if (child == NULL) {
+                return SCRIBE_ENOMEM;
+            }
+            if (node_set_tree(work, node, ev->path[i], child) != SCRIBE_OK) {
+                return SCRIBE_ENOMEM;
+            }
+        }
+        node = child;
+    }
+    if (ev->payload == NULL) {
+        node_delete(node, ev->path[ev->path_len - 1u]);
+        return SCRIBE_OK;
+    }
+    {
+        uint8_t blob_hash[SCRIBE_HASH_SIZE];
+        scribe_error_t err = scribe_object_write(ctx, SCRIBE_OBJECT_BLOB, ev->payload, ev->payload_len, blob_hash);
+        if (err != SCRIBE_OK) {
+            return err;
+        }
+        return node_set_blob(work, node, ev->path[ev->path_len - 1u], blob_hash);
+    }
+}
+
+static scribe_error_t write_tree_recursive(scribe_ctx *ctx, tree_node *node, uint8_t out_hash[SCRIBE_HASH_SIZE]) {
+    scribe_tree_entry *entries;
+    scribe_arena arena;
+    uint8_t *payload;
+    size_t payload_len;
+    size_t i;
+    scribe_error_t err;
+
+    err = scribe_arena_init(&arena, 1024u + node->count * 256u);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    entries = (scribe_tree_entry *)scribe_arena_alloc(&arena, sizeof(*entries) * (node->count == 0 ? 1u : node->count),
+                                                      _Alignof(scribe_tree_entry));
+    if (entries == NULL) {
+        scribe_arena_destroy(&arena);
+        return SCRIBE_ENOMEM;
+    }
+    memset(entries, 0, sizeof(*entries) * (node->count == 0 ? 1u : node->count));
+    for (i = 0; i < node->count; i++) {
+        entries[i].type = node->entries[i].type;
+        entries[i].name = node->entries[i].name;
+        entries[i].name_len = strlen(node->entries[i].name);
+        if (node->entries[i].type == SCRIBE_OBJECT_TREE) {
+            err = write_tree_recursive(ctx, node->entries[i].child, entries[i].hash);
+            if (err != SCRIBE_OK) {
+                scribe_arena_destroy(&arena);
+                return err;
+            }
+        } else {
+            scribe_hash_copy(entries[i].hash, node->entries[i].hash);
+        }
+    }
+    err = scribe_tree_serialize(entries, node->count, &arena, &payload, &payload_len);
+    if (err != SCRIBE_OK) {
+        scribe_arena_destroy(&arena);
+        return err;
+    }
+    err = scribe_object_write(ctx, SCRIBE_OBJECT_TREE, payload, payload_len, out_hash);
+    scribe_arena_destroy(&arena);
+    return err;
+}
+
+static scribe_error_t load_head_root(scribe_ctx *ctx, scribe_arena *work, tree_node **out_root,
+                                     uint8_t parent_hash[SCRIBE_HASH_SIZE], int *has_parent) {
+    scribe_error_t err;
+
+    err = scribe_refs_read(ctx, "refs/heads/main", parent_hash);
+    if (err == SCRIBE_ENOT_FOUND) {
+        *out_root = node_new(work);
+        *has_parent = 0;
+        return *out_root == NULL ? SCRIBE_ENOMEM : SCRIBE_OK;
+    }
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    *has_parent = 1;
+    {
+        scribe_object commit_obj;
+        scribe_arena arena;
+        scribe_commit_view view;
+        err = scribe_object_read(ctx, parent_hash, &commit_obj);
+        if (err != SCRIBE_OK) {
+            return err;
+        }
+        if (commit_obj.type != SCRIBE_OBJECT_COMMIT) {
+            scribe_object_free(&commit_obj);
+            return scribe_set_error(SCRIBE_ECORRUPT, "main ref does not point to a commit");
+        }
+        err = scribe_arena_init(&arena, commit_obj.payload_len + 1024u);
+        if (err != SCRIBE_OK) {
+            scribe_object_free(&commit_obj);
+            return err;
+        }
+        err = scribe_commit_parse(commit_obj.payload, commit_obj.payload_len, &arena, &view);
+        if (err == SCRIBE_OK) {
+            err = load_tree(ctx, work, view.root_tree, out_root);
+        }
+        scribe_arena_destroy(&arena);
+        scribe_object_free(&commit_obj);
+        return err;
+    }
+}
+
+scribe_error_t scribe_commit_batch_internal(scribe_ctx *ctx, const scribe_change_batch *batch,
+                                            uint8_t out_commit_hash[SCRIBE_HASH_SIZE]) {
+    tree_node *root = NULL;
+    uint8_t parent_hash[SCRIBE_HASH_SIZE];
+    uint8_t root_hash[SCRIBE_HASH_SIZE];
+    uint8_t *commit_payload;
+    size_t commit_payload_len;
+    scribe_arena arena;
+    scribe_arena work;
+    int has_parent = 0;
+    size_t i;
+    size_t work_capacity;
+    scribe_error_t err;
+
+    if (ctx == NULL || !ctx->writable) {
+        return scribe_set_error(SCRIBE_EINVAL, "writable context required");
+    }
+    if (batch != NULL && batch->event_count > (SIZE_MAX - (1024u * 1024u)) / 4096u) {
+        return scribe_set_error(SCRIBE_ENOMEM, "commit batch is too large");
+    }
+    work_capacity = 1024u * 1024u + (batch == NULL ? 0u : batch->event_count * 4096u);
+    err = scribe_arena_init(&work, work_capacity);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    err = load_head_root(ctx, &work, &root, parent_hash, &has_parent);
+    if (err != SCRIBE_OK) {
+        scribe_arena_destroy(&work);
+        return err;
+    }
+    for (i = 0; i < batch->event_count; i++) {
+        err = apply_change(ctx, &work, root, &batch->events[i]);
+        if (err != SCRIBE_OK) {
+            scribe_arena_destroy(&work);
+            return err;
+        }
+    }
+    err = write_tree_recursive(ctx, root, root_hash);
+    if (err != SCRIBE_OK) {
+        scribe_arena_destroy(&work);
+        return err;
+    }
+    err = scribe_arena_init(&arena, 4096u + (batch->message_len * 2u));
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    err = scribe_commit_serialize(root_hash, has_parent ? parent_hash : NULL, batch, &arena, &commit_payload,
+                                  &commit_payload_len);
+    if (err == SCRIBE_OK) {
+        err = scribe_object_write(ctx, SCRIBE_OBJECT_COMMIT, commit_payload, commit_payload_len, out_commit_hash);
+    }
+    scribe_arena_destroy(&arena);
+    scribe_arena_destroy(&work);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    err = scribe_refs_cas(ctx, "refs/heads/main", has_parent ? parent_hash : NULL, out_commit_hash);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    scribe_log_msg(ctx, SCRIBE_LOG_INFO, "commit", "wrote commit");
+    scribe_log_flush(ctx);
+    return SCRIBE_OK;
+}
+
+scribe_error_t scribe_commit_root_internal(scribe_ctx *ctx, const uint8_t root_tree[SCRIBE_HASH_SIZE],
+                                           const scribe_change_batch *metadata,
+                                           uint8_t out_commit_hash[SCRIBE_HASH_SIZE]) {
+    uint8_t parent_hash[SCRIBE_HASH_SIZE];
+    uint8_t *commit_payload;
+    size_t commit_payload_len;
+    scribe_arena arena;
+    int has_parent = 0;
+    scribe_error_t err;
+
+    if (ctx == NULL || !ctx->writable) {
+        return scribe_set_error(SCRIBE_EINVAL, "writable context required");
+    }
+    err = scribe_refs_read(ctx, "refs/heads/main", parent_hash);
+    if (err == SCRIBE_ENOT_FOUND) {
+        has_parent = 0;
+    } else if (err != SCRIBE_OK) {
+        return err;
+    } else {
+        has_parent = 1;
+    }
+    err = scribe_arena_init(&arena, 4096u + (metadata == NULL ? 0u : metadata->message_len * 2u));
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    err = scribe_commit_serialize_allow_empty(root_tree, has_parent ? parent_hash : NULL, metadata, &arena,
+                                              &commit_payload, &commit_payload_len);
+    if (err == SCRIBE_OK) {
+        err = scribe_object_write(ctx, SCRIBE_OBJECT_COMMIT, commit_payload, commit_payload_len, out_commit_hash);
+    }
+    scribe_arena_destroy(&arena);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    err = scribe_refs_cas(ctx, "refs/heads/main", has_parent ? parent_hash : NULL, out_commit_hash);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    scribe_log_msg(ctx, SCRIBE_LOG_INFO, "commit", "wrote commit");
+    scribe_log_flush(ctx);
+    return SCRIBE_OK;
+}

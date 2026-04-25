@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-linux:
+    name: build-linux (${{ matrix.os }}, ${{ matrix.cc }}, ${{ matrix.build_type }}, mongo=${{ matrix.mongo }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        cc: [gcc, clang]
+        build_type: [Release, Debug]
+        mongo: [ON, OFF]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: sudo scripts/install-deps-ubuntu.sh
+      - name: Configure
+        run: CC=${{ matrix.cc }} cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DSCRIBE_BUILD_MONGO_ADAPTER=${{ matrix.mongo }}
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: sanitizers (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: asan-ubsan
+            cc: gcc
+            flags: -DSCRIBE_ENABLE_ASAN=ON
+          - name: tsan-clang
+            cc: clang
+            flags: -DSCRIBE_ENABLE_TSAN=ON
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: sudo scripts/install-deps-ubuntu.sh
+      - name: Configure
+        run: CC=${{ matrix.cc }} cmake -B build -DCMAKE_BUILD_TYPE=Debug -DSCRIBE_BUILD_MONGO_ADAPTER=ON ${{ matrix.flags }}
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  smoke:
+    name: smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: sudo scripts/install-deps-ubuntu.sh
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSCRIBE_BUILD_MONGO_ADAPTER=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Smoke test
+        run: scripts/smoke-test.sh
+
+  format:
+    name: format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+      - name: Check formatting
+        run: find src include tests -name '*.[ch]' -print0 | xargs -0 clang-format --dry-run --Werror
