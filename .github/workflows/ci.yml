@@ -20,7 +20,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install dependencies
-        run: sudo scripts/install-deps-ubuntu.sh
+        run: sudo bash scripts/install-deps-ubuntu.sh
       - name: Configure
         run: CC=${{ matrix.cc }} cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DSCRIBE_BUILD_MONGO_ADAPTER=${{ matrix.mongo }}
       - name: Build
@@ -46,7 +46,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install dependencies
-        run: sudo scripts/install-deps-ubuntu.sh
+        run: sudo bash scripts/install-deps-ubuntu.sh
       - name: Configure
         run: CC=${{ matrix.cc }} cmake -B build -DCMAKE_BUILD_TYPE=Debug -DSCRIBE_BUILD_MONGO_ADAPTER=ON ${{ matrix.flags }}
       - name: Build
@@ -62,13 +62,13 @@ jobs:
         with:
           submodules: recursive
       - name: Install dependencies
-        run: sudo scripts/install-deps-ubuntu.sh
+        run: sudo bash scripts/install-deps-ubuntu.sh
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSCRIBE_BUILD_MONGO_ADAPTER=ON
       - name: Build
         run: cmake --build build -j
       - name: Smoke test
-        run: scripts/smoke-test.sh
+        run: bash scripts/smoke-test.sh
 
   format:
     name: format
