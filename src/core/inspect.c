@@ -535,7 +535,7 @@ scribe_error_t scribe_cli_show_path(scribe_ctx *ctx, const char *spec) {
     char *rev;
     uint8_t commit_hash[SCRIBE_HASH_SIZE];
     uint8_t target_hash[SCRIBE_HASH_SIZE];
-    uint8_t target_type;
+    uint8_t target_type = 0;
     scribe_commit_view view;
     scribe_error_t err;
 
