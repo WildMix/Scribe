@@ -125,8 +125,12 @@ scribe_error_t scribe_cli_show(scribe_ctx *ctx, const char *rev) {
     scribe_arena arena;
     scribe_commit_view view;
     char hex[SCRIBE_HEX_HASH_SIZE + 1];
-    scribe_error_t err = scribe_resolve_commit(ctx, rev, hash);
+    scribe_error_t err;
 
+    if (strchr(rev, ':') != NULL) {
+        return scribe_cli_show_path(ctx, rev);
+    }
+    err = scribe_resolve_commit(ctx, rev, hash);
     if (err != SCRIBE_OK) {
         return err;
     }

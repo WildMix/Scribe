@@ -386,14 +386,14 @@ last_commit <64-hex>
 last_updated <iso8601>
 ```
 
-Updated via temp-file + atomic rename *after* the corresponding commit has been durably written. Read at startup to resume; absent means bootstrap is required.
+Updated via temp-file + atomic rename *after* the corresponding commit has been durably written. Read at startup to resume; absent means bootstrap is required. If MongoDB rejects the saved token at stream-open time with `cannot resume stream` / `resume token was not found`, v1 marks the token invalid, runs bootstrap again, writes a new baseline commit parented to the existing history, persists the replacement token, and enters steady-state watch.
 
 **Change event kinds.** The MongoDB change stream emits many event types; see §20 for the per-type reference documents. v1 handles them as follows:
 
 - `insert`, `update`, `replace`, `modify`, `delete` — data mutations; each produces a `scribe_change_event` (insert/update/replace/modify → payload; delete → tombstone). Batched by transaction when applicable.
 - `create`, `drop`, `dropDatabase`, `rename` — DDL events. v1 logs these at INFO level and ignores them for commit purposes. Subsequent data events on the recreated/renamed collection will naturally appear at the new path. v2 may promote these to first-class commits.
 - `createIndexes`, `dropIndexes`, `refineCollectionShardKey`, `reshardCollection`, `shardCollection` — schema/sharding events. Logged and ignored for commit purposes in v1.
-- `invalidate` — the change stream is no longer valid; close and reopen from a new resume token. Logged at WARN level; triggers the reopen.
+- `invalidate` — the change stream is no longer valid. Logged at WARN level; v1 marks the token invalid, runs bootstrap again, writes a new baseline commit parented to existing history, persists the replacement token, and enters steady-state watch.
 
 Application-level author attribution (identifying the service or human that issued the write, not just the DB user) is *Open (v2)*.
 
@@ -449,7 +449,7 @@ command <scribe ... argv>
 
 A process that fails to acquire the lock exits with `SCRIBE_ELOCKED` and prints the holder's diagnostic info to stderr. Concurrent *readers* (`scribe log`, `scribe cat-object`, `scribe diff`) do not take the lock and are safe because objects are immutable once written and ref updates are atomic.
 
-**Signal handling.** `SIGTERM` and `SIGINT` trigger a clean shutdown: the main loop sets an atomic `shutdown_requested` flag. The running batch (if any) completes commit and ref update normally; the resume-token writer then persists the new state; only then does the process exit with status 0. In-flight change stream pulls are cancelled at the next iteration boundary (by closing the change stream handle). If a second `SIGTERM`/`SIGINT` arrives before clean shutdown completes, the process exits immediately with `SCRIBE_EINTERRUPTED` (non-zero); this may leave unreferenced objects on disk but cannot corrupt refs or the resume token, since neither has been updated for the in-flight batch.
+**Signal handling.** `SIGTERM` and `SIGINT` trigger a clean shutdown: the main loop sets an atomic `shutdown_requested` flag. The running batch (if any) completes commit and ref update normally; the resume-token writer then persists the new state; only then does the process exit with status 0. In-flight change stream pulls are cancelled at the next iteration boundary (by closing the change stream handle). If libmongoc reports an interrupted change stream after shutdown has already been requested, v1 treats it as clean shutdown after draining the current batch. If a second `SIGTERM`/`SIGINT` arrives before clean shutdown completes, the process exits immediately with `SCRIBE_EINTERRUPTED` (non-zero); this may leave unreferenced objects on disk but cannot corrupt refs or the resume token, since neither has been updated for the in-flight batch.
 
 `SIGHUP` is reserved for log rotation in v2. In v1 it is ignored.
 
@@ -463,8 +463,11 @@ The `scribe` binary is the single entry point. Subcommands:
 |-----------------------------------------|-------------------------------------------------------------------|
 | `scribe init <path>`                    | Create a new `.scribe/` store with a config skeleton              |
 | `scribe info`                           | Print version, config, hash algorithm, supported protocol range   |
+| `scribe list-objects [opts]`            | Enumerate store objects; optionally filter by type/reachability   |
 | `scribe log [--oneline] [-n <N>]`       | Walk commit history from HEAD                                     |
+| `scribe ls-tree <hash>`                 | List a tree recursively; commit hashes resolve to root trees      |
 | `scribe show <commit>`                  | Print commit metadata + list of touched paths                     |
+| `scribe show <commit>:<path>`           | Print raw blob bytes or list a tree at a path in a commit         |
 | `scribe cat-object (-p\|-t\|-s) <hash>` | Inspect an object: pretty, type, or size                          |
 | `scribe diff <commit1> [<commit2>]`     | Diff two commits (default: parent vs. commit1)                    |
 | `scribe commit-batch`                   | Pipe-form adapter entry point; reads framed input on stdin        |

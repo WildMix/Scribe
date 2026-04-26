@@ -17,8 +17,12 @@ static void usage(FILE *out) {
                  "commands:\n"
                  "  init [path]\n"
                  "  info\n"
+                 "  list-objects [--type=blob|tree|commit] [--reachable] [--format=<spec>]\n"
+                 "      default format: %%H %%T %%S; output is unsorted; %%C stats each object;\n"
+                 "      --reachable walks history and keeps an in-memory reachable set\n"
+                 "  ls-tree <hash> (recursive, byte-sorted storage order)\n"
                  "  log [--oneline] [-n <N>]\n"
-                 "  show <commit>\n"
+                 "  show <commit> | show <commit>:<path>\n"
                  "  cat-object (-p|-t|-s) <hash>\n"
                  "  diff <commit1> [<commit2>]\n"
                  "  commit-batch\n"
@@ -67,6 +71,10 @@ int main(int argc, char **argv) {
         usage(stderr);
         return (int)SCRIBE_EINVAL;
     }
+    if (strcmp(argv[argi], "--help") == 0 || strcmp(argv[argi], "-h") == 0) {
+        usage(stdout);
+        return 0;
+    }
     if (strcmp(argv[argi], "--store") == 0) {
         if (argi + 2 >= argc) {
             usage(stderr);
@@ -104,6 +112,55 @@ int main(int argc, char **argv) {
         err = scribe_pipe_commit_batch(ctx, stdin, stdout);
         scribe_close(ctx);
         return err == SCRIBE_OK ? 0 : (int)err;
+    }
+    if (strcmp(cmd, "list-objects") == 0) {
+        int type_mask = 0;
+        int reachable = 0;
+        const char *format = "%H %T %S";
+        while (argi < argc) {
+            if (strcmp(argv[argi], "--reachable") == 0) {
+                reachable = 1;
+                argi++;
+            } else if (strncmp(argv[argi], "--type=", 7) == 0) {
+                const char *type = argv[argi] + 7;
+                if (strcmp(type, "blob") == 0) {
+                    type_mask |= SCRIBE_LIST_TYPE_BLOB;
+                } else if (strcmp(type, "tree") == 0) {
+                    type_mask |= SCRIBE_LIST_TYPE_TREE;
+                } else if (strcmp(type, "commit") == 0) {
+                    type_mask |= SCRIBE_LIST_TYPE_COMMIT;
+                } else {
+                    return fail(scribe_set_error(SCRIBE_EINVAL, "invalid object type '%s'", type));
+                }
+                argi++;
+            } else if (strncmp(argv[argi], "--format=", 9) == 0) {
+                format = argv[argi] + 9;
+                argi++;
+            } else {
+                usage(stderr);
+                return (int)SCRIBE_EINVAL;
+            }
+        }
+        err = open_ctx(store, 0, &ctx);
+        if (err != SCRIBE_OK) {
+            return fail(err);
+        }
+        err = scribe_cli_list_objects(ctx, type_mask, reachable, format);
+        scribe_close(ctx);
+        return err == SCRIBE_OK ? 0 : fail(err);
+    }
+    if (strcmp(cmd, "ls-tree") == 0) {
+        if (argi != argc - 1) {
+            usage(stderr);
+            return (int)SCRIBE_EINVAL;
+        }
+        err = open_ctx(store, 0, &ctx);
+        if (err != SCRIBE_OK) {
+            return fail(err);
+        }
+        err = scribe_cli_ls_tree(ctx, argv[argi]);
+        scribe_close(ctx);
+        return err == SCRIBE_OK ? 0 : fail(err);
     }
     if (strcmp(cmd, "log") == 0) {
         int oneline = 0;

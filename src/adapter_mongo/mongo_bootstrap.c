@@ -1134,6 +1134,12 @@ static int token_is_usable(const char *resume_token) {
     return resume_token != NULL && resume_token[0] != '\0' && strcmp(resume_token, SCRIBE_MONGO_STATE_INVALID) != 0;
 }
 
+static int mongo_resume_error_is_unusable(const char *message) {
+    return message != NULL &&
+           (strstr(message, "cannot resume stream") != NULL || strstr(message, "resume token was not found") != NULL ||
+            strstr(message, "Resume token was not found") != NULL);
+}
+
 static scribe_error_t resume_token_to_base64(const bson_t *token, char **out) {
     if (token == NULL || bson_empty(token)) {
         return scribe_set_error(SCRIBE_EADAPTER, "MongoDB change stream event has no resume token");
@@ -1146,7 +1152,7 @@ static scribe_error_t resume_token_to_base64(const bson_t *token, char **out) {
 }
 
 static scribe_error_t open_change_stream(mongoc_client_t *client, const char *resume_token,
-                                         mongoc_change_stream_t **out) {
+                                         mongoc_change_stream_t **out, int *resume_token_unusable) {
     bson_t pipeline;
     bson_t opts;
     bson_t resume_doc;
@@ -1158,6 +1164,9 @@ static scribe_error_t open_change_stream(mongoc_client_t *client, const char *re
     scribe_error_t err = SCRIBE_OK;
     int has_resume_doc = 0;
 
+    if (resume_token_unusable != NULL) {
+        *resume_token_unusable = 0;
+    }
     bson_init(&pipeline);
     bson_init(&opts);
     BSON_APPEND_UTF8(&opts, "fullDocument", "updateLookup");
@@ -1189,6 +1198,9 @@ static scribe_error_t open_change_stream(mongoc_client_t *client, const char *re
     }
     if (mongoc_change_stream_error_document(stream, &error, &error_doc)) {
         (void)error_doc;
+        if (has_resume_doc && resume_token_unusable != NULL && mongo_resume_error_is_unusable(error.message)) {
+            *resume_token_unusable = 1;
+        }
         mongoc_change_stream_destroy(stream);
         return scribe_set_error(SCRIBE_EADAPTER, "failed to open MongoDB change stream: %s", error.message);
     }
@@ -1485,10 +1497,19 @@ static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client
         mongoc_change_stream_t *stream = NULL;
         mongo_watch_batch batch;
         int restart_stream = 0;
+        int resume_token_unusable = 0;
 
         memset(&batch, 0, sizeof(batch));
-        err = open_change_stream(client, *resume_token, &stream);
+        err = open_change_stream(client, *resume_token, &stream, &resume_token_unusable);
         if (err != SCRIBE_OK) {
+            if (resume_token_unusable) {
+                err = restart_bootstrap_after_invalidate(ctx, client, &batch, resume_token);
+                watch_batch_clear(&batch);
+                if (err != SCRIBE_OK) {
+                    return err;
+                }
+                continue;
+            }
             watch_batch_clear(&batch);
             return err;
         }
@@ -1539,7 +1560,14 @@ static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client
             }
             if (mongoc_change_stream_error_document(stream, &error, &error_doc)) {
                 (void)error_doc;
-                err = scribe_set_error(SCRIBE_EADAPTER, "MongoDB change stream failed: %s", error.message);
+                if (g_shutdown_requested) {
+                    err = watch_batch_commit(ctx, &batch);
+                } else if (token_is_usable(*resume_token) && mongo_resume_error_is_unusable(error.message)) {
+                    err = restart_bootstrap_after_invalidate(ctx, client, &batch, resume_token);
+                    restart_stream = 1;
+                } else {
+                    err = scribe_set_error(SCRIBE_EADAPTER, "MongoDB change stream failed: %s", error.message);
+                }
                 break;
             }
             err = watch_batch_commit(ctx, &batch);

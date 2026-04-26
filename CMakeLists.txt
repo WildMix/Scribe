@@ -77,6 +77,7 @@ set(SCRIBE_CORE_SOURCES
     src/core/diff.c
     src/core/fs.c
     src/core/fsck.c
+    src/core/inspect.c
     src/core/object.c
     src/core/pipe.c
     src/core/ref.c
@@ -151,4 +152,6 @@ if(SCRIBE_BUILD_TESTS)
     target_link_libraries(scribe_tests PRIVATE scribe_core unity scribe_warnings)
     scribe_apply_sanitizers(scribe_tests)
     add_test(NAME scribe_tests COMMAND scribe_tests)
+    add_test(NAME scribe_cli_features
+        COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_cli_features.sh" $<TARGET_FILE:scribe_cli>)
 endif()

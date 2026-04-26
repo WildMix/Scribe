@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -226,4 +227,122 @@ void scribe_object_free(scribe_object *obj) {
         free(obj->envelope);
         memset(obj, 0, sizeof(*obj));
     }
+}
+
+static int is_hex_char(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }
+
+static int is_hex_string(const char *s, size_t len) {
+    size_t i;
+
+    if (s == NULL) {
+        return 0;
+    }
+    for (i = 0; i < len; i++) {
+        if (!is_hex_char(s[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+typedef struct {
+    scribe_object_visit_fn visit;
+    void *user;
+    char dir_hex[3];
+} object_file_iter;
+
+static scribe_error_t visit_object_file(const char *name, void *vctx) {
+    object_file_iter *it = (object_file_iter *)vctx;
+    char hex[SCRIBE_HEX_HASH_SIZE + 1];
+    uint8_t hash[SCRIBE_HASH_SIZE];
+    scribe_error_t err;
+
+    if (strlen(name) != 62u || !is_hex_string(name, 62u)) {
+        return SCRIBE_OK;
+    }
+    snprintf(hex, sizeof(hex), "%s%s", it->dir_hex, name);
+    err = scribe_hash_from_hex(hex, hash);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    return it->visit(hash, it->user);
+}
+
+typedef struct {
+    scribe_ctx *ctx;
+    scribe_object_visit_fn visit;
+    void *user;
+} object_dir_iter;
+
+static scribe_error_t visit_object_dir(const char *name, void *vctx) {
+    object_dir_iter *it = (object_dir_iter *)vctx;
+    object_file_iter file_it;
+    char *objects;
+    char *dir;
+    scribe_error_t err;
+
+    if (strlen(name) != 2u || !is_hex_string(name, 2u)) {
+        return SCRIBE_OK;
+    }
+    objects = scribe_path_join(it->ctx->repo_path, "objects");
+    if (objects == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    dir = scribe_path_join(objects, name);
+    free(objects);
+    if (dir == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    file_it.visit = it->visit;
+    file_it.user = it->user;
+    file_it.dir_hex[0] = name[0];
+    file_it.dir_hex[1] = name[1];
+    file_it.dir_hex[2] = '\0';
+    err = scribe_list_dir(dir, visit_object_file, &file_it);
+    free(dir);
+    return err == SCRIBE_ENOT_FOUND ? SCRIBE_OK : err;
+}
+
+scribe_error_t scribe_object_iter(scribe_ctx *ctx, scribe_object_visit_fn visit, void *user) {
+    object_dir_iter it;
+    char *objects;
+    scribe_error_t err;
+
+    if (ctx == NULL || visit == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid object iterator arguments");
+    }
+    objects = scribe_path_join(ctx->repo_path, "objects");
+    if (objects == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    it.ctx = ctx;
+    it.visit = visit;
+    it.user = user;
+    err = scribe_list_dir(objects, visit_object_dir, &it);
+    free(objects);
+    return err == SCRIBE_ENOT_FOUND ? SCRIBE_OK : err;
+}
+
+scribe_error_t scribe_object_compressed_size(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE], size_t *out) {
+    struct stat st;
+    char *path;
+
+    if (ctx == NULL || hash == NULL || out == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid compressed-size arguments");
+    }
+    path = scribe_object_path(ctx, hash);
+    if (path == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    if (stat(path, &st) != 0) {
+        free(path);
+        return errno == ENOENT ? scribe_set_error(SCRIBE_ENOT_FOUND, "object not found")
+                               : scribe_set_error(SCRIBE_EIO, "failed to stat object");
+    }
+    free(path);
+    if (st.st_size < 0 || (uintmax_t)st.st_size > (uintmax_t)SIZE_MAX) {
+        return scribe_set_error(SCRIBE_EIO, "invalid compressed object size");
+    }
+    *out = (size_t)st.st_size;
+    return SCRIBE_OK;
 }

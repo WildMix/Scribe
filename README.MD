@@ -199,9 +199,10 @@ Adapter state is stored in:
 .scribe/adapter-state/mongodb
 ```
 
-On startup, `mongo-watch` resumes from the saved token when possible. If the token
-is unusable after invalidation, Scribe marks it invalid, logs a warning, and writes
-a new bootstrap commit parented to existing history.
+On startup, `mongo-watch` resumes from the saved token when possible. If MongoDB
+rejects the saved token with `cannot resume stream` or `resume token was not found`,
+Scribe marks it invalid, logs a warning, writes a new bootstrap commit parented to
+existing history, persists the replacement token, and continues watching.
 
 ## Repository Layout
 
@@ -226,6 +227,8 @@ Signals:
 - `SIGTERM` and `SIGINT` request clean shutdown.
 - If a batch is in flight, Scribe finishes the commit first.
 - Adapter state is persisted only after the commit succeeds.
+- A shutdown-time libmongoc stream interruption is treated as clean shutdown after
+  the current batch drains.
 - The repository lock is released before exit.
 
 Logging:

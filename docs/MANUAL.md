@@ -228,6 +228,41 @@ Network docker_default  Removing
 Network docker_default  Removed
 ```
 
+### Inspecting History
+
+`scribe show <commit>:<path>` writes the raw blob bytes stored at that path. Quote the whole argument when the path contains shell-special characters such as braces or quotes:
+
+```sh
+./build/scribe --store /tmp/scribe-manual-quick/.scribe show 'HEAD:scribe_test/users/"manual-alice"' | jq .
+```
+
+Output:
+
+```json
+{
+  "_id": "manual-alice",
+  "role": "admin"
+}
+```
+
+Blob-level diffs are composed with external tools; v1 does not include `scribe diff-blobs` because raw blob output works cleanly with `jq`, `diff`, and similar tools.
+
+```sh
+diff -u <(./build/scribe --store /tmp/scribe-manual-diff/.scribe show '<64-hex>:db/users/a' | jq .) <(./build/scribe --store /tmp/scribe-manual-diff/.scribe show '<64-hex>:db/users/a' | jq .)
+```
+
+Output:
+
+```diff
+--- /dev/fd/63
++++ /dev/fd/62
+@@ -1,3 +1,3 @@
+ {
+-  "role": "user"
++  "role": "admin"
+ }
+```
+
 ## The `.scribe/` Repository
 
 `scribe init` creates these paths:
@@ -360,6 +395,27 @@ Output:
 initialized /tmp/scribe-manual-quick/.scribe
 ```
 
+### `list-objects`
+
+Synopsis: `scribe [--store <path>] list-objects [--type=blob|tree|commit] [--reachable] [--format=<spec>]`
+
+Lists objects in the store. Default output is unsorted filesystem iteration order and one object per line as `<hash> <type> <uncompressed-size>`. Pipe to `sort` when stable order is needed.
+
+Multiple `--type=` flags accumulate. `--reachable` walks the full parent chain from `HEAD`, plus every tree and blob reachable from each commit root tree, and keeps that reachable hash set in memory. On very large stores this can be significant. `%C` in the format performs one `stat` per object to report compressed on-disk size; this is acceptable for v1 one-off inspection, not a high-volume query path.
+
+Supported format placeholders are `%H` hash, `%T` type, `%S` uncompressed payload size, and `%C` compressed/on-disk size.
+
+```sh
+./build/scribe --store /tmp/scribe-manual-quick/.scribe list-objects --reachable --type=commit --format='%H %T %S %C'
+```
+
+Output:
+
+```text
+<64-hex> commit 285 <compressed-bytes>
+<64-hex> commit 240 <compressed-bytes>
+```
+
 ### `log`
 
 Synopsis: `scribe [--store <path>] log [--oneline] [-n <N>]`
@@ -375,6 +431,26 @@ Output:
 ```text
 <12-hex> mongo change stream
 <12-hex> mongo bootstrap
+```
+
+### `ls-tree`
+
+Synopsis: `scribe [--store <path>] ls-tree <hash>`
+
+Lists a tree recursively in byte-sorted UTF-8 storage order. If `<hash>` is a commit, Scribe lists the commit's root tree. If `<hash>` is a blob, Scribe fails with `SCRIBE_EINVAL`.
+
+Output is tab-separated: `<type>\t<hash>\t<path>`.
+
+```sh
+./build/scribe --store /tmp/scribe-manual-quick/.scribe ls-tree <64-hex>
+```
+
+Output:
+
+```text
+tree	<64-hex>	scribe_test
+tree	<64-hex>	scribe_test/users
+blob	<64-hex>	scribe_test/users/"manual-alice"
 ```
 
 ### `mongo-watch`
@@ -396,9 +472,9 @@ Output excerpt:
 
 ### `show`
 
-Synopsis: `scribe [--store <path>] show <commit>`
+Synopsis: `scribe [--store <path>] show <commit>` or `scribe [--store <path>] show <commit>:<path>`
 
-Prints commit metadata and touched paths.
+Without `:<path>`, prints commit metadata and touched paths. With `:<path>`, resolves the path in the commit root tree. Blob paths write raw blob bytes to stdout with no Scribe-added newline; tree paths list recursively like `ls-tree`. An empty path, `<commit>:`, lists the commit root tree.
 
 ```sh
 ./build/scribe --store /tmp/scribe-manual-quick/.scribe show HEAD
@@ -417,6 +493,16 @@ mongo change stream
 
 changes:
 A scribe_test/users/"manual-alice"
+```
+
+```sh
+./build/scribe --store /tmp/scribe-manual-quick/.scribe show 'HEAD:scribe_test/users/"manual-alice"'
+```
+
+Output:
+
+```text
+{"_id":"manual-alice","role":"admin"}
 ```
 
 ## The MongoDB Adapter
@@ -451,7 +537,7 @@ Output:
 
 By default Scribe excludes `admin`, `local`, and `config`. Change `.scribe/config` key `adapter.mongodb.excluded_databases` to override that list.
 
-On startup, `mongo-watch` reads `.scribe/adapter-state/mongodb`. If the token is usable, it resumes. If MongoDB invalidates the stream, Scribe marks the token invalid, logs a warning, and writes a new bootstrap commit parented to the existing history.
+On startup, `mongo-watch` reads `.scribe/adapter-state/mongodb`. If the token is usable, it resumes. If MongoDB rejects the saved token with `cannot resume stream` or `resume token was not found`, Scribe treats it like an invalidated stream: it marks the token invalid, logs a warning, writes a new bootstrap commit parented to the existing history, stores the new resume token, and continues watching.
 
 Event handling in v1:
 
@@ -495,7 +581,7 @@ ENTRYPOINT ["scribe"]
 
 ### Signal Handling
 
-`SIGTERM` and `SIGINT` request clean shutdown. If a batch is in flight, Scribe finishes the commit first, then writes adapter-state and releases the lock.
+`SIGTERM` and `SIGINT` request clean shutdown. If a batch is in flight, Scribe finishes the commit first, then writes adapter-state and releases the lock. If libmongoc reports an interrupted change stream after shutdown has already been requested, Scribe treats that as part of clean shutdown rather than surfacing `SCRIBE_EADAPTER`.
 
 Executed verification command:
 
@@ -678,6 +764,14 @@ scribe: SCRIBE_EADAPTER: Mongo hello failed: No suitable servers found (`serverS
 ```
 
 Fix: confirm the URI, replica-set name, and primary state. Current code retries topology checks during startup to avoid this transient in the local compose fixture.
+
+Observed when a saved MongoDB change stream token has fallen out of the server oplog window or otherwise cannot be resumed:
+
+```text
+scribe: SCRIBE_EADAPTER: failed to open MongoDB change stream: PlanExecutor error during aggregation :: caused by :: cannot resume stream; the resume token was not found.
+```
+
+Current code recovers from this automatically: it logs `change stream resume token is unusable; restarting bootstrap`, writes a new bootstrap commit parented to existing history, persists the replacement token, and continues watching. If this error still reaches the CLI, rebuild and confirm the installed `scribe` binary is the updated one.
 
 ### `SCRIBE_ENOMEM`
 

@@ -14,6 +14,10 @@
 #define SCRIBE_OBJECT_TREE 0x02u
 #define SCRIBE_OBJECT_COMMIT 0x03u
 
+#define SCRIBE_LIST_TYPE_BLOB 0x01
+#define SCRIBE_LIST_TYPE_TREE 0x02
+#define SCRIBE_LIST_TYPE_COMMIT 0x04
+
 typedef struct {
     int scribe_format_version;
     int compression_level;
@@ -47,6 +51,8 @@ typedef struct {
     uint8_t *envelope;
     size_t envelope_len;
 } scribe_object;
+
+typedef scribe_error_t (*scribe_object_visit_fn)(const uint8_t hash[SCRIBE_HASH_SIZE], void *user);
 
 typedef struct {
     uint8_t root_tree[SCRIBE_HASH_SIZE];
@@ -91,6 +97,8 @@ scribe_error_t scribe_object_read(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HAS
 void scribe_object_free(scribe_object *obj);
 scribe_error_t scribe_object_has(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE]);
 char *scribe_object_path(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE]);
+scribe_error_t scribe_object_iter(scribe_ctx *ctx, scribe_object_visit_fn visit, void *user);
+scribe_error_t scribe_object_compressed_size(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE], size_t *out);
 
 scribe_error_t scribe_tree_serialize(const scribe_tree_entry *entries, size_t count, scribe_arena *arena, uint8_t **out,
                                      size_t *out_len);
@@ -113,9 +121,12 @@ scribe_error_t scribe_commit_root_internal(scribe_ctx *ctx, const uint8_t root_t
 
 scribe_error_t scribe_cli_log(scribe_ctx *ctx, int oneline, size_t limit);
 scribe_error_t scribe_cli_show(scribe_ctx *ctx, const char *rev);
+scribe_error_t scribe_cli_show_path(scribe_ctx *ctx, const char *spec);
 scribe_error_t scribe_cli_cat_object(scribe_ctx *ctx, char mode, const char *hex);
 scribe_error_t scribe_cli_diff(scribe_ctx *ctx, const char *a, const char *b);
 scribe_error_t scribe_cli_fsck(scribe_ctx *ctx);
+scribe_error_t scribe_cli_list_objects(scribe_ctx *ctx, int type_mask, int reachable, const char *format);
+scribe_error_t scribe_cli_ls_tree(scribe_ctx *ctx, const char *hex);
 scribe_error_t scribe_resolve_commit(scribe_ctx *ctx, const char *rev, uint8_t out[SCRIBE_HASH_SIZE]);
 
 scribe_error_t scribe_pipe_commit_batch(scribe_ctx *ctx, FILE *in, FILE *out);

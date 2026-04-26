@@ -203,3 +203,41 @@ void test_pipe_commit_batch(void) {
     free(out_buf);
     scribe_close(ctx);
 }
+
+typedef struct {
+    uint8_t expected[SCRIBE_HASH_SIZE];
+    size_t count;
+    int saw_expected;
+} object_iter_test_state;
+
+static scribe_error_t count_object_visit(const uint8_t hash[SCRIBE_HASH_SIZE], void *user) {
+    object_iter_test_state *state = (object_iter_test_state *)user;
+
+    state->count++;
+    if (memcmp(hash, state->expected, SCRIBE_HASH_SIZE) == 0) {
+        state->saw_expected = 1;
+    }
+    return SCRIBE_OK;
+}
+
+void test_object_iterator_and_compressed_size(void) {
+    char tmpl[] = "/tmp/scribe-object-iter-test-XXXXXX";
+    scribe_ctx *ctx = NULL;
+    const uint8_t payload[] = "dangling";
+    uint8_t hash[SCRIBE_HASH_SIZE];
+    size_t compressed_size = 0;
+    object_iter_test_state state;
+
+    make_temp_repo(tmpl);
+    TEST_ASSERT_EQUAL(SCRIBE_OK, scribe_init_repository(tmpl));
+    TEST_ASSERT_EQUAL(SCRIBE_OK, scribe_open(tmpl, 1, &ctx));
+    TEST_ASSERT_EQUAL(SCRIBE_OK, scribe_object_write(ctx, SCRIBE_OBJECT_BLOB, payload, sizeof(payload) - 1u, hash));
+    memset(&state, 0, sizeof(state));
+    scribe_hash_copy(state.expected, hash);
+    TEST_ASSERT_EQUAL(SCRIBE_OK, scribe_object_iter(ctx, count_object_visit, &state));
+    TEST_ASSERT_EQUAL_size_t(1, state.count);
+    TEST_ASSERT_TRUE(state.saw_expected);
+    TEST_ASSERT_EQUAL(SCRIBE_OK, scribe_object_compressed_size(ctx, hash, &compressed_size));
+    TEST_ASSERT_GREATER_THAN_size_t(0, compressed_size);
+    scribe_close(ctx);
+}
