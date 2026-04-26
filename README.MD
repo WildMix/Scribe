@@ -152,7 +152,7 @@ bash scripts/smoke-test.sh
 
 | Command | Purpose |
 | --- | --- |
-| `scribe init <path>` | Create an empty `.scribe/` repository. |
+| `scribe init [path]` | Create an empty `.scribe/` repository, defaulting to `.scribe` in the current directory. |
 | `scribe info` | Print binary and repository configuration information. |
 | `scribe commit-batch` | Read one pipe protocol v1 batch from stdin and commit it. |
 | `scribe log [--oneline] [-n <N>]` | Walk commit history from `HEAD`. |
@@ -197,7 +197,7 @@ a new bootstrap commit parented to existing history.
 
 ## Repository Layout
 
-`scribe init` creates a `.scribe/` repository with these paths:
+`scribe init` creates a `.scribe/` repository with these paths. With no path argument, it initializes `.scribe` in the current directory; with global `--store <path>`, it initializes that store path.
 
 - `HEAD`: text pointer to `refs/heads/main`.
 - `config`: v1 flat configuration file.

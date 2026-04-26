@@ -1,6 +1,7 @@
 /build/
 /build-*/
 /.idea/
+/.scribe/
 /adapter-state/
 /objects/
 /refs/

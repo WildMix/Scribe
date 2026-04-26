@@ -346,9 +346,9 @@ store .scribe (not initialized)
 
 ### `init`
 
-Synopsis: `scribe init <path>`
+Synopsis: `scribe init [path]`
 
-Creates an empty Scribe repository.
+Creates an empty Scribe repository. If `path` is omitted, Scribe initializes the global `--store` path when supplied, otherwise `.scribe` in the current directory.
 
 ```sh
 ./build/scribe init /tmp/scribe-manual-quick/.scribe

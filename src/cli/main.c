@@ -15,7 +15,7 @@ static void usage(FILE *out) {
     fprintf(out, "usage: scribe [--store <path>] <command> [args]\n"
                  "\n"
                  "commands:\n"
-                 "  init <path>\n"
+                 "  init [path]\n"
                  "  info\n"
                  "  log [--oneline] [-n <N>]\n"
                  "  show <commit>\n"
@@ -78,15 +78,19 @@ int main(int argc, char **argv) {
     cmd = argv[argi++];
 
     if (strcmp(cmd, "init") == 0) {
-        if (argi != argc - 1) {
+        const char *init_path = store;
+        if (argi + 1 < argc) {
             usage(stderr);
             return (int)SCRIBE_EINVAL;
         }
-        err = scribe_init_repository(argv[argi]);
+        if (argi < argc) {
+            init_path = argv[argi];
+        }
+        err = scribe_init_repository(init_path);
         if (err != SCRIBE_OK) {
             return fail(err);
         }
-        printf("initialized %s\n", argv[argi]);
+        printf("initialized %s\n", init_path);
         return 0;
     }
     if (strcmp(cmd, "info") == 0) {
