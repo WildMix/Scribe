@@ -13,6 +13,14 @@ inspect the resulting history locally.
 For the complete operator manual, see [docs/MANUAL.md](docs/MANUAL.md). For the
 implementation design, see [DESIGN.md](DESIGN.md).
 
+## Disclaimer
+
+This project was entirely "vibe coded"—the architectural vision and design are mine, but the heavy lifting in the
+implementation was handled by AI (gpt 5.5 with codex with the help of opus 4.7 for additional reviews). While I built
+this to solve a genuine need in my daily workflow and it’s working
+beautifully for me, use it at your own risk. I take no responsibility for the implementation details or any unintended "
+hallucinations" in the code.
+
 ## Status
 
 v1 includes:
@@ -150,17 +158,17 @@ bash scripts/smoke-test.sh
 
 ## Command Summary
 
-| Command | Purpose |
-| --- | --- |
-| `scribe init [path]` | Create an empty `.scribe/` repository, defaulting to `.scribe` in the current directory. |
-| `scribe info` | Print binary and repository configuration information. |
-| `scribe commit-batch` | Read one pipe protocol v1 batch from stdin and commit it. |
-| `scribe log [--oneline] [-n <N>]` | Walk commit history from `HEAD`. |
-| `scribe show <commit>` | Print commit metadata and touched paths. |
-| `scribe diff <commit1> [<commit2>]` | Show path-level changes between commits. |
-| `scribe cat-object (-p|-t|-s) <hash>` | Print object content, type, or payload size. |
-| `scribe fsck` | Walk reachable objects, verify envelopes and hashes, and report dangling objects. |
-| `scribe mongo-watch <uri>` | Bootstrap and watch MongoDB changes. |
+| Command                             | Purpose                                                                                  |
+|-------------------------------------|------------------------------------------------------------------------------------------|
+| `scribe init [path]`                | Create an empty `.scribe/` repository, defaulting to `.scribe` in the current directory. |
+| `scribe info`                       | Print binary and repository configuration information.                                   |
+| `scribe commit-batch`               | Read one pipe protocol v1 batch from stdin and commit it.                                |
+| `scribe log [--oneline] [-n <N>]`   | Walk commit history from `HEAD`.                                                         |
+| `scribe show <commit>`              | Print commit metadata and touched paths.                                                 |
+| `scribe diff <commit1> [<commit2>]` | Show path-level changes between commits.                                                 |
+| `scribe cat-object (-p              | -t                                                                                       |-s) <hash>` | Print object content, type, or payload size. |
+| `scribe fsck`                       | Walk reachable objects, verify envelopes and hashes, and report dangling objects.        |
+| `scribe mongo-watch <uri>`          | Bootstrap and watch MongoDB changes.                                                     |
 
 Most commands accept `--store <path>` before the command. `mongo-watch` also
 accepts the smoke-test form:
@@ -197,7 +205,8 @@ a new bootstrap commit parented to existing history.
 
 ## Repository Layout
 
-`scribe init` creates a `.scribe/` repository with these paths. With no path argument, it initializes `.scribe` in the current directory; with global `--store <path>`, it initializes that store path.
+`scribe init` creates a `.scribe/` repository with these paths. With no path argument, it initializes `.scribe` in the
+current directory; with global `--store <path>`, it initializes that store path.
 
 - `HEAD`: text pointer to `refs/heads/main`.
 - `config`: v1 flat configuration file.
