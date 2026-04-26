@@ -3,7 +3,7 @@ services:
     image: mongo:7
     command: ["mongod", "--replSet", "scribe-rs", "--bind_ip_all", "--port", "27017"]
     ports:
-      - "27017:27017"
+      - "27018:27017"
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "quit(db.hello().isWritablePrimary ? 0 : 1)"]
       interval: 2s

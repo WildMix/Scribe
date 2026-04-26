@@ -103,10 +103,13 @@ rm -rf /tmp/scribe-quick && mkdir -p /tmp/scribe-quick
 ./build/scribe init /tmp/scribe-quick/.scribe
 ```
 
-Start the MongoDB adapter in one terminal:
+Start the MongoDB adapter in one terminal. The Docker fixture publishes host port
+`27018` to the container's MongoDB port `27017`; use `directConnection=true` so
+the MongoDB driver does not switch to the replica set's advertised internal
+`localhost:27017` address:
 
 ```sh
-./build/scribe mongo-watch "mongodb://localhost:27017/?replicaSet=scribe-rs" --store /tmp/scribe-quick/.scribe
+./build/scribe mongo-watch "mongodb://localhost:27018/?directConnection=true" --store /tmp/scribe-quick/.scribe
 ```
 
 In another terminal, insert a document:
@@ -163,15 +166,16 @@ Most commands accept `--store <path>` before the command. `mongo-watch` also
 accepts the smoke-test form:
 
 ```sh
-./build/scribe mongo-watch "mongodb://localhost:27017/?replicaSet=scribe-rs" --store /tmp/scribe-quick/.scribe
+./build/scribe mongo-watch "mongodb://localhost:27018/?directConnection=true" --store /tmp/scribe-quick/.scribe
 ```
 
 ## MongoDB Adapter
 
 Use a replica set or sharded cluster. Standalone MongoDB does not provide change
 streams. The local fixture in `docker/` starts a single-node replica set named
-`scribe-rs` on port `27017`, creates `scribe_test.users`, and enables pre/post
-images on that collection.
+`scribe-rs`, runs MongoDB on container port `27017`, publishes it on host port
+`27018`, creates `scribe_test.users`, and enables pre/post images on that
+collection.
 
 MongoDB event handling in v1:
 

@@ -130,10 +130,10 @@ Output:
 initialized /tmp/scribe-manual-quick/.scribe
 ```
 
-Start the MongoDB adapter in one terminal:
+Start the MongoDB adapter in one terminal. The Docker fixture publishes host port `27018` to the container's MongoDB port `27017`; use `directConnection=true` because the single-node replica set advertises its internal `localhost:27017` member address:
 
 ```sh
-./build/scribe mongo-watch "mongodb://localhost:27017/?replicaSet=scribe-rs" --store /tmp/scribe-manual-quick/.scribe
+./build/scribe mongo-watch "mongodb://localhost:27018/?directConnection=true" --store /tmp/scribe-manual-quick/.scribe
 ```
 
 Output excerpt:
@@ -384,7 +384,7 @@ Synopsis: `scribe [--store <path>] mongo-watch <uri>` or `scribe mongo-watch <ur
 Runs the MongoDB adapter. It bootstraps current state, resumes from saved tokens on restart, consumes change streams, and exits cleanly on `SIGTERM` or `SIGINT`.
 
 ```sh
-./build/scribe mongo-watch "mongodb://localhost:27017/?replicaSet=scribe-rs" --store /tmp/scribe-manual-quick/.scribe
+./build/scribe mongo-watch "mongodb://localhost:27018/?directConnection=true" --store /tmp/scribe-manual-quick/.scribe
 ```
 
 Output excerpt:
@@ -421,13 +421,21 @@ A scribe_test/users/"manual-alice"
 
 ## The MongoDB Adapter
 
-Use a replica set or sharded cluster. Standalone MongoDB does not provide change streams. The local fixture in `docker/` starts a single-node replica set named `scribe-rs` on port `27017` and creates `scribe_test.users` with pre/post images enabled.
+Use a replica set or sharded cluster. Standalone MongoDB does not provide change streams. The local fixture in `docker/` starts a single-node replica set named `scribe-rs`, runs MongoDB on container port `27017`, publishes it on host port `27018`, and creates `scribe_test.users` with pre/post images enabled.
 
 Connection URI format:
 
 ```text
 mongodb://<host>:<port>/?replicaSet=<name>
 ```
+
+For the local Docker fixture from the WSL or Windows host, use:
+
+```text
+mongodb://localhost:27018/?directConnection=true
+```
+
+The `directConnection=true` option prevents the MongoDB driver from rediscovering the replica set member as `localhost:27017`, which is the container-internal address and may also conflict with a Windows MongoDB service.
 
 Pre- and post-images are enabled per collection:
 

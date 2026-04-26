@@ -5,8 +5,9 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 COMPOSE_FILE="$ROOT_DIR/docker/docker-compose.yml"
 SMOKE_DIR=/tmp/scribe-smoke
 STORE="$SMOKE_DIR/.scribe"
-MONGO_URI="mongodb://localhost:27017/?replicaSet=scribe-rs"
-MONGO_DB_URI="mongodb://localhost:27017/scribe_test?replicaSet=scribe-rs"
+MONGO_URI="mongodb://localhost:27018/?directConnection=true"
+MONGO_DB_URI="mongodb://localhost:27018/scribe_test?directConnection=true"
+MONGO_CONTAINER_DB_URI="mongodb://localhost:27017/scribe_test?replicaSet=scribe-rs"
 SCRIBE_PID=
 COMPOSE_STARTED=0
 
@@ -29,7 +30,7 @@ mongo_eval() {
     if command -v mongosh >/dev/null 2>&1; then
         mongosh "$MONGO_DB_URI" --eval "$1"
     else
-        docker compose -f "$COMPOSE_FILE" exec -T mongo mongosh "$MONGO_DB_URI" --eval "$1"
+        docker compose -f "$COMPOSE_FILE" exec -T mongo mongosh "$MONGO_CONTAINER_DB_URI" --eval "$1"
     fi
 }
 
@@ -47,7 +48,7 @@ rm -rf "$SMOKE_DIR" && mkdir -p "$SMOKE_DIR"
 echo "3. ./build/scribe init /tmp/scribe-smoke/.scribe"
 ./build/scribe init "$STORE"
 
-echo "4. ./build/scribe mongo-watch \"mongodb://localhost:27017/?replicaSet=scribe-rs\" --store /tmp/scribe-smoke/.scribe &"
+echo "4. ./build/scribe mongo-watch \"mongodb://localhost:27018/?directConnection=true\" --store /tmp/scribe-smoke/.scribe &"
 ./build/scribe mongo-watch "$MONGO_URI" --store "$STORE" >"$SMOKE_DIR/watch.out" 2>"$SMOKE_DIR/watch.err" &
 SCRIBE_PID=$!
 
@@ -71,7 +72,7 @@ while ! grep -F "watching MongoDB change stream" "$SMOKE_DIR/watch.err" >/dev/nu
     sleep 1
 done
 
-echo "6. mongosh \"mongodb://localhost:27017/scribe_test?replicaSet=scribe-rs\" --eval 'db.users.insertOne({_id: \"alice\", role: \"admin\"})'"
+echo "6. mongosh \"mongodb://localhost:27018/scribe_test?directConnection=true\" --eval 'db.users.insertOne({_id: \"alice\", role: \"admin\"})'"
 mongo_eval 'db.users.insertOne({_id: "alice", role: "admin"})' >/dev/null
 
 echo "7. sleep 1"
