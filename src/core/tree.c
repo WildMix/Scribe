@@ -76,6 +76,17 @@ scribe_error_t scribe_tree_serialize(const scribe_tree_entry *entries, size_t co
     return SCRIBE_OK;
 }
 
+scribe_error_t scribe_tree_parse_arena_capacity(size_t payload_len, size_t *out) {
+    if (out == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid tree parse arena capacity output");
+    }
+    if (payload_len > (SIZE_MAX - 4096u) / 8u) {
+        return scribe_set_error(SCRIBE_ENOMEM, "tree payload is too large");
+    }
+    *out = payload_len * 8u + 4096u;
+    return SCRIBE_OK;
+}
+
 scribe_error_t scribe_tree_parse(const uint8_t *payload, size_t len, scribe_arena *arena,
                                  scribe_tree_entry **out_entries, size_t *out_count) {
     size_t off = 0;

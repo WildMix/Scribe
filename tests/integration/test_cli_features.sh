@@ -129,4 +129,51 @@ if "$BIN" --store "$STORE" list-objects --format='%X' >"$ROOT/bad-format.out" 2>
 fi
 grep -F 'SCRIBE_EINVAL' "$ROOT/bad-format.err" >/dev/null || fail "invalid format did not use SCRIBE_EINVAL"
 
+LARGE_ROOT=$(mktemp -d)
+LARGE_STORE="$LARGE_ROOT/.scribe"
+LARGE_COUNT=5000
+"$BIN" init "$LARGE_STORE" >/dev/null
+large_c1=$(
+    {
+        printf 'BATCH\t1\t%s\n' "$LARGE_COUNT"
+        printf 'AUTHOR\ttester\t\ttest\n'
+        printf 'COMMITTER\tscribe-test\t\tscribe\n'
+        printf 'PROCESS\tcli-test\t1\t\tlarge-tree\n'
+        printf 'TIMESTAMP\t300\n'
+        printf 'MESSAGE\t0\n'
+        i=0
+        while [ "$i" -lt "$LARGE_COUNT" ]; do
+            id=$(printf 'id%05d' "$i")
+            printf 'EVENT\t3\t7\n'
+            printf 'db\nbig\n%s\n' "$id"
+            printf '{"v":0}'
+            i=$((i + 1))
+        done
+        printf 'END\n'
+    } | "$BIN" --store "$LARGE_STORE" commit-batch | awk -F '\t' '$1 == "OK" { print $2 }'
+)
+[ -n "$large_c1" ] || fail "large tree commit was not created"
+"$BIN" --store "$LARGE_STORE" ls-tree "$large_c1" >"$LARGE_ROOT/large-ls-tree"
+large_lines=$(awk 'END { print NR }' "$LARGE_ROOT/large-ls-tree")
+[ "$large_lines" = "5002" ] || fail "large ls-tree did not traverse every object"
+large_c2=$(
+    {
+        printf 'BATCH\t1\t1\n'
+        printf 'AUTHOR\ttester\t\ttest\n'
+        printf 'COMMITTER\tscribe-test\t\tscribe\n'
+        printf 'PROCESS\tcli-test\t1\t\tlarge-update\n'
+        printf 'TIMESTAMP\t400\n'
+        printf 'MESSAGE\t0\n'
+        printf 'EVENT\t3\t7\n'
+        printf 'db\nbig\nid02500\n'
+        printf '{"v":1}'
+        printf 'END\n'
+    } | "$BIN" --store "$LARGE_STORE" commit-batch | awk -F '\t' '$1 == "OK" { print $2 }'
+)
+[ -n "$large_c2" ] || fail "large tree update commit was not created"
+printf '{"v":1}' >"$LARGE_ROOT/expected-large-v1"
+"$BIN" --store "$LARGE_STORE" show "$large_c2:db/big/id02500" >"$LARGE_ROOT/show-large-v1"
+cmp -s "$LARGE_ROOT/expected-large-v1" "$LARGE_ROOT/show-large-v1" ||
+    fail "large tree update did not preserve updated blob"
+
 echo "test_cli_features: passed"

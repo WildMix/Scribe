@@ -102,6 +102,7 @@ static scribe_error_t read_tree_entries(scribe_ctx *ctx, const uint8_t hash[SCRI
                                         scribe_tree_entry **entries, size_t *count) {
     scribe_object obj;
     scribe_error_t err;
+    size_t arena_capacity = 0;
 
     err = scribe_arena_init(arena, 0);
     if (err != SCRIBE_OK) {
@@ -115,11 +116,10 @@ static scribe_error_t read_tree_entries(scribe_ctx *ctx, const uint8_t hash[SCRI
         scribe_object_free(&obj);
         return scribe_set_error(SCRIBE_ECORRUPT, "object is not a tree");
     }
-    if (obj.payload_len > SIZE_MAX - 4096u) {
-        scribe_object_free(&obj);
-        return scribe_set_error(SCRIBE_ENOMEM, "tree payload is too large");
+    err = scribe_tree_parse_arena_capacity(obj.payload_len, &arena_capacity);
+    if (err == SCRIBE_OK) {
+        err = scribe_arena_init(arena, arena_capacity);
     }
-    err = scribe_arena_init(arena, obj.payload_len + 4096u);
     if (err != SCRIBE_OK) {
         scribe_object_free(&obj);
         return err;
@@ -258,8 +258,13 @@ static scribe_error_t walk_reachable_tree(hash_set *set, scribe_ctx *ctx, scribe
     scribe_tree_entry *entries = NULL;
     size_t count = 0;
     size_t i;
-    scribe_error_t err = scribe_arena_init(&arena, obj->payload_len + 4096u);
+    size_t arena_capacity = 0;
+    scribe_error_t err = scribe_tree_parse_arena_capacity(obj->payload_len, &arena_capacity);
 
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    err = scribe_arena_init(&arena, arena_capacity);
     if (err != SCRIBE_OK) {
         return err;
     }

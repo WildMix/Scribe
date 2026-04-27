@@ -124,6 +124,40 @@ static void node_delete(tree_node *node, const char *name) {
     node->count--;
 }
 
+static scribe_error_t checked_add_size(size_t *total, size_t add) {
+    if (*total > SIZE_MAX - add) {
+        return scribe_set_error(SCRIBE_ENOMEM, "tree arena size is too large");
+    }
+    *total += add;
+    return SCRIBE_OK;
+}
+
+static scribe_error_t tree_write_arena_capacity(const tree_node *node, size_t *out) {
+    size_t i;
+    size_t entry_count;
+    size_t total = 4096u;
+
+    if (node == NULL || out == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid tree arena capacity input");
+    }
+    entry_count = node->count == 0 ? 1u : node->count;
+    if (entry_count > SIZE_MAX / sizeof(scribe_tree_entry)) {
+        return scribe_set_error(SCRIBE_ENOMEM, "tree has too many entries");
+    }
+    if (checked_add_size(&total, sizeof(scribe_tree_entry) * entry_count) != SCRIBE_OK ||
+        checked_add_size(&total, sizeof(scribe_tree_entry) * entry_count) != SCRIBE_OK) {
+        return SCRIBE_ENOMEM;
+    }
+    for (i = 0; i < node->count; i++) {
+        size_t name_len = strlen(node->entries[i].name);
+        if (checked_add_size(&total, 1u + SCRIBE_HASH_SIZE + 10u + name_len) != SCRIBE_OK) {
+            return SCRIBE_ENOMEM;
+        }
+    }
+    *out = total;
+    return SCRIBE_OK;
+}
+
 static scribe_error_t load_tree(scribe_ctx *ctx, scribe_arena *work, const uint8_t hash[SCRIBE_HASH_SIZE],
                                 tree_node **out) {
     scribe_object obj;
@@ -133,6 +167,7 @@ static scribe_error_t load_tree(scribe_ctx *ctx, scribe_arena *work, const uint8
     size_t i;
     tree_node *node;
     scribe_error_t err;
+    size_t arena_capacity = 0;
 
     err = scribe_object_read(ctx, hash, &obj);
     if (err != SCRIBE_OK) {
@@ -142,7 +177,10 @@ static scribe_error_t load_tree(scribe_ctx *ctx, scribe_arena *work, const uint8
         scribe_object_free(&obj);
         return scribe_set_error(SCRIBE_ECORRUPT, "expected tree object");
     }
-    err = scribe_arena_init(&arena, obj.payload_len + 1024u + (obj.payload_len / 8u));
+    err = scribe_tree_parse_arena_capacity(obj.payload_len, &arena_capacity);
+    if (err == SCRIBE_OK) {
+        err = scribe_arena_init(&arena, arena_capacity);
+    }
     if (err != SCRIBE_OK) {
         scribe_object_free(&obj);
         return err;
@@ -181,6 +219,54 @@ static scribe_error_t load_tree(scribe_ctx *ctx, scribe_arena *work, const uint8
     scribe_arena_destroy(&arena);
     scribe_object_free(&obj);
     *out = node;
+    return SCRIBE_OK;
+}
+
+static scribe_error_t estimate_tree_work_capacity(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE],
+                                                  size_t *capacity) {
+    scribe_object obj;
+    scribe_arena arena;
+    scribe_tree_entry *entries = NULL;
+    size_t count = 0;
+    size_t i;
+    size_t parse_capacity = 0;
+    scribe_error_t err;
+
+    err = scribe_object_read(ctx, hash, &obj);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    if (obj.type != SCRIBE_OBJECT_TREE) {
+        scribe_object_free(&obj);
+        return scribe_set_error(SCRIBE_ECORRUPT, "expected tree object");
+    }
+    err = scribe_tree_parse_arena_capacity(obj.payload_len, &parse_capacity);
+    if (err == SCRIBE_OK) {
+        err = checked_add_size(capacity, parse_capacity);
+    }
+    if (err == SCRIBE_OK) {
+        err = scribe_arena_init(&arena, parse_capacity);
+    }
+    if (err != SCRIBE_OK) {
+        scribe_object_free(&obj);
+        return err;
+    }
+    err = scribe_tree_parse(obj.payload, obj.payload_len, &arena, &entries, &count);
+    scribe_object_free(&obj);
+    if (err != SCRIBE_OK) {
+        scribe_arena_destroy(&arena);
+        return err;
+    }
+    for (i = 0; i < count; i++) {
+        if (entries[i].type == SCRIBE_OBJECT_TREE) {
+            err = estimate_tree_work_capacity(ctx, entries[i].hash, capacity);
+            if (err != SCRIBE_OK) {
+                scribe_arena_destroy(&arena);
+                return err;
+            }
+        }
+    }
+    scribe_arena_destroy(&arena);
     return SCRIBE_OK;
 }
 
@@ -229,8 +315,12 @@ static scribe_error_t write_tree_recursive(scribe_ctx *ctx, tree_node *node, uin
     size_t payload_len;
     size_t i;
     scribe_error_t err;
+    size_t arena_capacity = 0;
 
-    err = scribe_arena_init(&arena, 1024u + node->count * 256u);
+    err = tree_write_arena_capacity(node, &arena_capacity);
+    if (err == SCRIBE_OK) {
+        err = scribe_arena_init(&arena, arena_capacity);
+    }
     if (err != SCRIBE_OK) {
         return err;
     }
@@ -265,15 +355,15 @@ static scribe_error_t write_tree_recursive(scribe_ctx *ctx, tree_node *node, uin
     return err;
 }
 
-static scribe_error_t load_head_root(scribe_ctx *ctx, scribe_arena *work, tree_node **out_root,
-                                     uint8_t parent_hash[SCRIBE_HASH_SIZE], int *has_parent) {
+static scribe_error_t read_head_root_hash(scribe_ctx *ctx, uint8_t parent_hash[SCRIBE_HASH_SIZE], int *has_parent,
+                                          uint8_t root_hash[SCRIBE_HASH_SIZE]) {
     scribe_error_t err;
 
     err = scribe_refs_read(ctx, "refs/heads/main", parent_hash);
     if (err == SCRIBE_ENOT_FOUND) {
-        *out_root = node_new(work);
         *has_parent = 0;
-        return *out_root == NULL ? SCRIBE_ENOMEM : SCRIBE_OK;
+        memset(root_hash, 0, SCRIBE_HASH_SIZE);
+        return SCRIBE_OK;
     }
     if (err != SCRIBE_OK) {
         return err;
@@ -298,7 +388,7 @@ static scribe_error_t load_head_root(scribe_ctx *ctx, scribe_arena *work, tree_n
         }
         err = scribe_commit_parse(commit_obj.payload, commit_obj.payload_len, &arena, &view);
         if (err == SCRIBE_OK) {
-            err = load_tree(ctx, work, view.root_tree, out_root);
+            scribe_hash_copy(root_hash, view.root_tree);
         }
         scribe_arena_destroy(&arena);
         scribe_object_free(&commit_obj);
@@ -310,6 +400,7 @@ scribe_error_t scribe_commit_batch_internal(scribe_ctx *ctx, const scribe_change
                                             uint8_t out_commit_hash[SCRIBE_HASH_SIZE]) {
     tree_node *root = NULL;
     uint8_t parent_hash[SCRIBE_HASH_SIZE];
+    uint8_t parent_root_hash[SCRIBE_HASH_SIZE];
     uint8_t root_hash[SCRIBE_HASH_SIZE];
     uint8_t *commit_payload;
     size_t commit_payload_len;
@@ -323,18 +414,36 @@ scribe_error_t scribe_commit_batch_internal(scribe_ctx *ctx, const scribe_change
     if (ctx == NULL || !ctx->writable) {
         return scribe_set_error(SCRIBE_EINVAL, "writable context required");
     }
+    err = read_head_root_hash(ctx, parent_hash, &has_parent, parent_root_hash);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
     if (batch != NULL && batch->event_count > (SIZE_MAX - (1024u * 1024u)) / 4096u) {
         return scribe_set_error(SCRIBE_ENOMEM, "commit batch is too large");
     }
     work_capacity = 1024u * 1024u + (batch == NULL ? 0u : batch->event_count * 4096u);
+    if (has_parent) {
+        err = estimate_tree_work_capacity(ctx, parent_root_hash, &work_capacity);
+        if (err != SCRIBE_OK) {
+            return err;
+        }
+    }
     err = scribe_arena_init(&work, work_capacity);
     if (err != SCRIBE_OK) {
         return err;
     }
-    err = load_head_root(ctx, &work, &root, parent_hash, &has_parent);
-    if (err != SCRIBE_OK) {
-        scribe_arena_destroy(&work);
-        return err;
+    if (has_parent) {
+        err = load_tree(ctx, &work, parent_root_hash, &root);
+        if (err != SCRIBE_OK) {
+            scribe_arena_destroy(&work);
+            return err;
+        }
+    } else {
+        root = node_new(&work);
+        if (root == NULL) {
+            scribe_arena_destroy(&work);
+            return SCRIBE_ENOMEM;
+        }
     }
     for (i = 0; i < batch->event_count; i++) {
         err = apply_change(ctx, &work, root, &batch->events[i]);

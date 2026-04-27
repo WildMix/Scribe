@@ -102,6 +102,7 @@ scribe_error_t scribe_object_compressed_size(scribe_ctx *ctx, const uint8_t hash
 
 scribe_error_t scribe_tree_serialize(const scribe_tree_entry *entries, size_t count, scribe_arena *arena, uint8_t **out,
                                      size_t *out_len);
+scribe_error_t scribe_tree_parse_arena_capacity(size_t payload_len, size_t *out);
 scribe_error_t scribe_tree_parse(const uint8_t *payload, size_t len, scribe_arena *arena,
                                  scribe_tree_entry **out_entries, size_t *out_count);
 

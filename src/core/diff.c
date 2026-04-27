@@ -185,7 +185,12 @@ static scribe_error_t pretty_tree(scribe_object *obj) {
     scribe_tree_entry *entries = NULL;
     size_t count = 0;
     size_t i;
-    scribe_error_t err = scribe_arena_init(&arena, obj->payload_len + 1024u);
+    size_t arena_capacity = 0;
+    scribe_error_t err = scribe_tree_parse_arena_capacity(obj->payload_len, &arena_capacity);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    err = scribe_arena_init(&arena, arena_capacity);
     if (err != SCRIBE_OK) {
         return err;
     }
@@ -257,12 +262,22 @@ static scribe_error_t parse_tree_object(scribe_ctx *ctx, const uint8_t hash[SCRI
                                         scribe_tree_entry **entries, size_t *count) {
     scribe_object obj;
     scribe_error_t err = scribe_object_read(ctx, hash, &obj);
+    size_t arena_capacity = 0;
     if (err != SCRIBE_OK) {
         return err;
     }
     if (obj.type != SCRIBE_OBJECT_TREE) {
         scribe_object_free(&obj);
         return scribe_set_error(SCRIBE_ECORRUPT, "expected tree while diffing");
+    }
+    err = scribe_tree_parse_arena_capacity(obj.payload_len, &arena_capacity);
+    if (err == SCRIBE_OK) {
+        scribe_arena_destroy(arena);
+        err = scribe_arena_init(arena, arena_capacity);
+    }
+    if (err != SCRIBE_OK) {
+        scribe_object_free(&obj);
+        return err;
     }
     err = scribe_tree_parse(obj.payload, obj.payload_len, arena, entries, count);
     scribe_object_free(&obj);

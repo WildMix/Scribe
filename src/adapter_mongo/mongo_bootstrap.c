@@ -464,6 +464,40 @@ static scribe_error_t snapshot_add_result(scribe_ctx *ctx, mongo_snapshot_node *
     return snapshot_node_set_blob(coll, result->path[2], blob_hash);
 }
 
+static scribe_error_t checked_add_size(size_t *total, size_t add) {
+    if (*total > SIZE_MAX - add) {
+        return scribe_set_error(SCRIBE_ENOMEM, "MongoDB snapshot tree arena size is too large");
+    }
+    *total += add;
+    return SCRIBE_OK;
+}
+
+static scribe_error_t snapshot_tree_arena_capacity(const mongo_snapshot_node *node, size_t *out) {
+    size_t i;
+    size_t entry_count;
+    size_t total = 4096u;
+
+    if (node == NULL || out == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid MongoDB snapshot tree arena capacity input");
+    }
+    entry_count = node->count == 0 ? 1u : node->count;
+    if (entry_count > SIZE_MAX / sizeof(scribe_tree_entry)) {
+        return scribe_set_error(SCRIBE_ENOMEM, "MongoDB snapshot tree has too many entries");
+    }
+    if (checked_add_size(&total, sizeof(scribe_tree_entry) * entry_count) != SCRIBE_OK ||
+        checked_add_size(&total, sizeof(scribe_tree_entry) * entry_count) != SCRIBE_OK) {
+        return SCRIBE_ENOMEM;
+    }
+    for (i = 0; i < node->count; i++) {
+        size_t name_len = strlen(node->entries[i].name);
+        if (checked_add_size(&total, 1u + SCRIBE_HASH_SIZE + 10u + name_len) != SCRIBE_OK) {
+            return SCRIBE_ENOMEM;
+        }
+    }
+    *out = total;
+    return SCRIBE_OK;
+}
+
 static scribe_error_t snapshot_write_tree(scribe_ctx *ctx, mongo_snapshot_node *node,
                                           uint8_t out_hash[SCRIBE_HASH_SIZE]) {
     scribe_tree_entry *entries;
@@ -472,8 +506,12 @@ static scribe_error_t snapshot_write_tree(scribe_ctx *ctx, mongo_snapshot_node *
     size_t payload_len;
     size_t i;
     scribe_error_t err;
+    size_t arena_capacity = 0;
 
-    err = scribe_arena_init(&arena, 1024u + node->count * 256u);
+    err = snapshot_tree_arena_capacity(node, &arena_capacity);
+    if (err == SCRIBE_OK) {
+        err = scribe_arena_init(&arena, arena_capacity);
+    }
     if (err != SCRIBE_OK) {
         return err;
     }
