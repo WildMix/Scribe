@@ -378,6 +378,8 @@ Each batch produces one Scribe commit with:
 - `process.name` = `"mongo-change-stream"`, `version` = Scribe version, `correlation_id` = the change event's `_id._data` (resume token opaque form).
 - `timestamp_unix_nanos` = the event's `clusterTime` converted to nanoseconds. `clusterTime` in Mongo has second precision plus a 32-bit increment counter; the adapter packs both by computing `seconds * 10^9 + increment`. This preserves monotonicity within a second without claiming precision it does not have.
 
+**Watch scope.** If the MongoDB URI omits a database path, v1 uses `mongoc_client_watch`, bootstraps every non-excluded database, and requires privileges for a cluster-wide change stream through `admin`. If the URI includes a database path, v1 uses `mongoc_database_watch`, bootstraps only that explicit database, and treats that path as an operator-selected scope that bypasses the excluded-database list.
+
 **Resume tokens.** Written to `.scribe/adapter-state/mongodb` as a simple text file:
 
 ```

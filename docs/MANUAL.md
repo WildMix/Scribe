@@ -515,6 +515,12 @@ Connection URI format:
 mongodb://<host>:<port>/?replicaSet=<name>
 ```
 
+When the URI omits a database path, Scribe bootstraps every non-excluded database and opens a cluster-wide change stream. That requires MongoDB privileges sufficient to watch the cluster through the `admin` database. For hosted MongoDB users with narrower permissions, include the database path in the URI; Scribe then bootstraps only that database and uses a database-scoped change stream:
+
+```text
+mongodb+srv://<credentials>@<cluster>/<database>?authMechanism=MONGODB-AWS&authSource=%24external
+```
+
 For the local Docker fixture from the WSL or Windows host, use:
 
 ```text
@@ -536,6 +542,8 @@ Output:
 ```
 
 By default Scribe excludes `admin`, `local`, and `config`. Change `.scribe/config` key `adapter.mongodb.excluded_databases` to override that list.
+
+An explicit database path takes precedence over the excluded-database list because it is an operator-selected scope.
 
 On startup, `mongo-watch` reads `.scribe/adapter-state/mongodb`. If the token is usable, it resumes. If MongoDB rejects the saved token with `cannot resume stream` or `resume token was not found`, Scribe treats it like an invalidated stream: it marks the token invalid, logs a warning, writes a new bootstrap commit parented to the existing history, stores the new resume token, and continues watching.
 
@@ -764,6 +772,14 @@ scribe: SCRIBE_EADAPTER: Mongo hello failed: No suitable servers found (`serverS
 ```
 
 Fix: confirm the URI, replica-set name, and primary state. Current code retries topology checks during startup to avoid this transient in the local compose fixture.
+
+Observed when the URI omits a database path but the MongoDB user cannot open a cluster-wide change stream on `admin`:
+
+```text
+scribe: SCRIBE_EADAPTER: failed to capture MongoDB resume token: not authorized on admin to execute command { aggregate: 1, pipeline: [ { $changeStream: { showExpandedEvents: true, allChangesForCluster: true } } ], ... }
+```
+
+Fix: either grant cluster-wide change stream privileges, or scope Scribe to one database by adding the database path before the query string, for example `mongodb+srv://<credentials>@<cluster>/<database>?authMechanism=MONGODB-AWS&authSource=%24external`.
 
 Observed when a saved MongoDB change stream token has fallen out of the server oplog window or otherwise cannot be resumed:
 

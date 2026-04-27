@@ -185,6 +185,18 @@ streams. The local fixture in `docker/` starts a single-node replica set named
 `27018`, creates `scribe_test.users`, and enables pre/post images on that
 collection.
 
+If the MongoDB URI omits a database path, Scribe watches the whole cluster and
+needs privileges to open a change stream through `admin`. For hosted MongoDB users
+with narrower permissions, include the database path before the query string:
+
+```text
+mongodb+srv://<credentials>@<cluster>/<database>?authMechanism=MONGODB-AWS&authSource=%24external
+```
+
+With a database path present, Scribe bootstraps only that database and opens a
+database-scoped change stream. The explicit database path takes precedence over
+the excluded-database list.
+
 MongoDB event handling in v1:
 
 - `insert`, `update`, `replace`, and `modify` commit the canonical full document.

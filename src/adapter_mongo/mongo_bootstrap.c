@@ -24,6 +24,10 @@ typedef enum {
     MONGO_EVENT_INVALIDATE = 2,
 } mongo_event_kind;
 
+typedef struct {
+    char *database;
+} mongo_watch_scope;
+
 typedef struct mongo_task {
     bson_t *doc;
     char *db;
@@ -61,6 +65,38 @@ typedef struct {
     mongo_results *results;
     scribe_error_t err;
 } mongo_worker_ctx;
+
+static void mongo_watch_scope_destroy(mongo_watch_scope *scope) {
+    if (scope != NULL) {
+        free(scope->database);
+        scope->database = NULL;
+    }
+}
+
+static scribe_error_t mongo_watch_scope_from_uri(const char *uri, mongo_watch_scope *scope) {
+    mongoc_uri_t *parsed;
+    bson_error_t error;
+    const char *database;
+
+    if (scope == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid MongoDB watch scope");
+    }
+    scope->database = NULL;
+    parsed = mongoc_uri_new_with_error(uri, &error);
+    if (parsed == NULL) {
+        return scribe_set_error(SCRIBE_EADAPTER, "invalid MongoDB URI: %s", error.message);
+    }
+    database = mongoc_uri_get_database(parsed);
+    if (database != NULL && database[0] != '\0') {
+        scope->database = strdup(database);
+        if (scope->database == NULL) {
+            mongoc_uri_destroy(parsed);
+            return scribe_set_error(SCRIBE_ENOMEM, "failed to allocate MongoDB watch database");
+        }
+    }
+    mongoc_uri_destroy(parsed);
+    return SCRIBE_OK;
+}
 
 static char *base64_encode(const uint8_t *data, size_t len) {
     static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -600,7 +636,23 @@ static scribe_error_t verify_topology_with_retry(scribe_ctx *ctx, mongoc_client_
     return err;
 }
 
-static scribe_error_t capture_start_resume_token(mongoc_client_t *client, char **out_token) {
+static mongoc_change_stream_t *watch_from_scope(mongoc_client_t *client, const mongo_watch_scope *scope,
+                                                const bson_t *pipeline, const bson_t *opts) {
+    if (scope != NULL && scope->database != NULL) {
+        mongoc_database_t *db = mongoc_client_get_database(client, scope->database);
+        mongoc_change_stream_t *stream;
+        if (db == NULL) {
+            return NULL;
+        }
+        stream = mongoc_database_watch(db, pipeline, opts);
+        mongoc_database_destroy(db);
+        return stream;
+    }
+    return mongoc_client_watch(client, pipeline, opts);
+}
+
+static scribe_error_t capture_start_resume_token(mongoc_client_t *client, const mongo_watch_scope *scope,
+                                                 char **out_token) {
     bson_t pipeline;
     bson_t opts;
     mongoc_change_stream_t *stream;
@@ -614,7 +666,7 @@ static scribe_error_t capture_start_resume_token(mongoc_client_t *client, char *
     bson_init(&opts);
     BSON_APPEND_INT32(&opts, "maxAwaitTimeMS", 100);
     BSON_APPEND_BOOL(&opts, "showExpandedEvents", true);
-    stream = mongoc_client_watch(client, &pipeline, &opts);
+    stream = watch_from_scope(client, scope, &pipeline, &opts);
     bson_destroy(&pipeline);
     bson_destroy(&opts);
     if (stream == NULL) {
@@ -625,7 +677,16 @@ static scribe_error_t capture_start_resume_token(mongoc_client_t *client, char *
     (void)error_doc;
     if (has_error) {
         mongoc_change_stream_destroy(stream);
-        return scribe_set_error(SCRIBE_EADAPTER, "failed to capture MongoDB resume token: %s", error.message);
+        if (scope != NULL && scope->database != NULL && strstr(error.message, "not authorized on admin") != NULL) {
+            return scribe_set_error(SCRIBE_EADAPTER, "failed to capture MongoDB resume token for database '%s': %s",
+                                    scope->database, error.message);
+        }
+        return scribe_set_error(
+            SCRIBE_EADAPTER, "failed to capture MongoDB resume token: %s%s", error.message,
+            scope == NULL || scope->database == NULL
+                ? "; cluster-wide watch requires admin-level change stream privileges; use a URI with /<database> "
+                  "for database-scoped watching when only one database is authorized"
+                : "");
     }
     token = mongoc_change_stream_get_resume_token(stream);
     if (token == NULL || bson_empty(token)) {
@@ -698,42 +759,58 @@ static scribe_error_t enqueue_collection(mongo_task_queue *queue, mongoc_collect
     return SCRIBE_OK;
 }
 
-static scribe_error_t enqueue_all_documents(scribe_ctx *ctx, mongoc_client_t *client, mongo_task_queue *queue) {
+static scribe_error_t enqueue_database_documents(mongoc_client_t *client, mongo_task_queue *queue,
+                                                 const char *db_name) {
+    bson_error_t error;
+    mongoc_database_t *db;
+    char **collections;
+    size_t j;
+
+    db = mongoc_client_get_database(client, db_name);
+    collections = mongoc_database_get_collection_names_with_opts(db, NULL, &error);
+    if (collections == NULL) {
+        mongoc_database_destroy(db);
+        return scribe_set_error(SCRIBE_EADAPTER, "failed to list Mongo collections for database '%s': %s", db_name,
+                                error.message);
+    }
+    for (j = 0; collections[j] != NULL; j++) {
+        mongoc_collection_t *collection = mongoc_database_get_collection(db, collections[j]);
+        scribe_error_t err = enqueue_collection(queue, collection, db_name, collections[j]);
+        mongoc_collection_destroy(collection);
+        if (err != SCRIBE_OK) {
+            bson_strfreev(collections);
+            mongoc_database_destroy(db);
+            return err;
+        }
+    }
+    bson_strfreev(collections);
+    mongoc_database_destroy(db);
+    return SCRIBE_OK;
+}
+
+static scribe_error_t enqueue_all_documents(scribe_ctx *ctx, mongoc_client_t *client, const mongo_watch_scope *scope,
+                                            mongo_task_queue *queue) {
     bson_error_t error;
     char **dbs;
     size_t i;
 
+    if (scope != NULL && scope->database != NULL) {
+        return enqueue_database_documents(client, queue, scope->database);
+    }
     dbs = mongoc_client_get_database_names_with_opts(client, NULL, &error);
     if (dbs == NULL) {
         return scribe_set_error(SCRIBE_EADAPTER, "failed to list Mongo databases: %s", error.message);
     }
     for (i = 0; dbs[i] != NULL; i++) {
-        mongoc_database_t *db;
-        char **collections;
-        size_t j;
+        scribe_error_t err;
         if (is_excluded_db(ctx, dbs[i])) {
             continue;
         }
-        db = mongoc_client_get_database(client, dbs[i]);
-        collections = mongoc_database_get_collection_names_with_opts(db, NULL, &error);
-        if (collections == NULL) {
-            mongoc_database_destroy(db);
+        err = enqueue_database_documents(client, queue, dbs[i]);
+        if (err != SCRIBE_OK) {
             bson_strfreev(dbs);
-            return scribe_set_error(SCRIBE_EADAPTER, "failed to list Mongo collections: %s", error.message);
+            return err;
         }
-        for (j = 0; collections[j] != NULL; j++) {
-            mongoc_collection_t *collection = mongoc_database_get_collection(db, collections[j]);
-            scribe_error_t err = enqueue_collection(queue, collection, dbs[i], collections[j]);
-            mongoc_collection_destroy(collection);
-            if (err != SCRIBE_OK) {
-                bson_strfreev(collections);
-                mongoc_database_destroy(db);
-                bson_strfreev(dbs);
-                return err;
-            }
-        }
-        bson_strfreev(collections);
-        mongoc_database_destroy(db);
     }
     bson_strfreev(dbs);
     return SCRIBE_OK;
@@ -915,7 +992,7 @@ static scribe_error_t commit_results(scribe_ctx *ctx, mongo_results *results, ui
     return scribe_commit_root_internal(ctx, root_hash, &batch, out_commit);
 }
 
-static scribe_error_t run_bootstrap(scribe_ctx *ctx, mongoc_client_t *client) {
+static scribe_error_t run_bootstrap(scribe_ctx *ctx, mongoc_client_t *client, const mongo_watch_scope *scope) {
     mongo_task_queue queue;
     mongo_results results;
     pthread_t *threads = NULL;
@@ -927,7 +1004,7 @@ static scribe_error_t run_bootstrap(scribe_ctx *ctx, mongoc_client_t *client) {
     char *start_resume_token = NULL;
     scribe_error_t err;
 
-    err = capture_start_resume_token(client, &start_resume_token);
+    err = capture_start_resume_token(client, scope, &start_resume_token);
     if (err != SCRIBE_OK) {
         return err;
     }
@@ -960,7 +1037,7 @@ static scribe_error_t run_bootstrap(scribe_ctx *ctx, mongoc_client_t *client) {
         }
     }
     if (err == SCRIBE_OK) {
-        err = enqueue_all_documents(ctx, client, &queue);
+        err = enqueue_all_documents(ctx, client, scope, &queue);
     }
     task_queue_close(&queue);
     for (i = 0; i < workers; i++) {
@@ -1151,8 +1228,9 @@ static scribe_error_t resume_token_to_base64(const bson_t *token, char **out) {
     return SCRIBE_OK;
 }
 
-static scribe_error_t open_change_stream(mongoc_client_t *client, const char *resume_token,
-                                         mongoc_change_stream_t **out, int *resume_token_unusable) {
+static scribe_error_t open_change_stream(mongoc_client_t *client, const mongo_watch_scope *scope,
+                                         const char *resume_token, mongoc_change_stream_t **out,
+                                         int *resume_token_unusable) {
     bson_t pipeline;
     bson_t opts;
     bson_t resume_doc;
@@ -1189,7 +1267,7 @@ static scribe_error_t open_change_stream(mongoc_client_t *client, const char *re
         has_resume_doc = 1;
         BSON_APPEND_DOCUMENT(&opts, "resumeAfter", &resume_doc);
     }
-    stream = mongoc_client_watch(client, &pipeline, &opts);
+    stream = watch_from_scope(client, scope, &pipeline, &opts);
     bson_destroy(&pipeline);
     bson_destroy(&opts);
     free(decoded);
@@ -1465,7 +1543,8 @@ static scribe_error_t handle_data_event(scribe_ctx *ctx, mongo_watch_batch *batc
 }
 
 static scribe_error_t restart_bootstrap_after_invalidate(scribe_ctx *ctx, mongoc_client_t *client,
-                                                         mongo_watch_batch *batch, char **resume_token) {
+                                                         const mongo_watch_scope *scope, mongo_watch_batch *batch,
+                                                         char **resume_token) {
     scribe_error_t err;
 
     err = watch_batch_commit(ctx, batch);
@@ -1477,7 +1556,7 @@ static scribe_error_t restart_bootstrap_after_invalidate(scribe_ctx *ctx, mongoc
         return err;
     }
     scribe_log_msg(ctx, SCRIBE_LOG_WARN, "mongo", "change stream resume token is unusable; restarting bootstrap");
-    err = run_bootstrap(ctx, client);
+    err = run_bootstrap(ctx, client, scope);
     if (err != SCRIBE_OK) {
         return err;
     }
@@ -1490,7 +1569,8 @@ static scribe_error_t restart_bootstrap_after_invalidate(scribe_ctx *ctx, mongoc
     return err;
 }
 
-static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client, char **resume_token) {
+static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client, const mongo_watch_scope *scope,
+                                        char **resume_token) {
     scribe_error_t err;
 
     while (!g_shutdown_requested) {
@@ -1500,10 +1580,10 @@ static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client
         int resume_token_unusable = 0;
 
         memset(&batch, 0, sizeof(batch));
-        err = open_change_stream(client, *resume_token, &stream, &resume_token_unusable);
+        err = open_change_stream(client, scope, *resume_token, &stream, &resume_token_unusable);
         if (err != SCRIBE_OK) {
             if (resume_token_unusable) {
-                err = restart_bootstrap_after_invalidate(ctx, client, &batch, resume_token);
+                err = restart_bootstrap_after_invalidate(ctx, client, scope, &batch, resume_token);
                 watch_batch_clear(&batch);
                 if (err != SCRIBE_OK) {
                     return err;
@@ -1546,7 +1626,7 @@ static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client
                     err = handle_data_event(ctx, &batch, event, op, &event_token);
                 } else if (kind == MONGO_EVENT_INVALIDATE) {
                     free(event_token);
-                    err = restart_bootstrap_after_invalidate(ctx, client, &batch, resume_token);
+                    err = restart_bootstrap_after_invalidate(ctx, client, scope, &batch, resume_token);
                     restart_stream = 1;
                 } else {
                     scribe_log_msg(ctx, SCRIBE_LOG_INFO, "mongo", "ignored MongoDB change stream event '%s'", op);
@@ -1563,7 +1643,7 @@ static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client
                 if (g_shutdown_requested) {
                     err = watch_batch_commit(ctx, &batch);
                 } else if (token_is_usable(*resume_token) && mongo_resume_error_is_unusable(error.message)) {
-                    err = restart_bootstrap_after_invalidate(ctx, client, &batch, resume_token);
+                    err = restart_bootstrap_after_invalidate(ctx, client, scope, &batch, resume_token);
                     restart_stream = 1;
                 } else {
                     err = scribe_set_error(SCRIBE_EADAPTER, "MongoDB change stream failed: %s", error.message);
@@ -1590,6 +1670,7 @@ static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client
 
 scribe_error_t scribe_mongo_watch_bootstrap(scribe_ctx *ctx, const char *uri) {
     mongoc_client_t *client = NULL;
+    mongo_watch_scope scope;
     char *resume_token = NULL;
     uint8_t last_commit[SCRIBE_HASH_SIZE];
     scribe_error_t err;
@@ -1603,14 +1684,24 @@ scribe_error_t scribe_mongo_watch_bootstrap(scribe_ctx *ctx, const char *uri) {
         return err;
     }
     mongoc_init();
+    err = mongo_watch_scope_from_uri(uri, &scope);
+    if (err != SCRIBE_OK) {
+        mongoc_cleanup();
+        return err;
+    }
+    if (scope.database != NULL) {
+        scribe_log_msg(ctx, SCRIBE_LOG_INFO, "mongo", "using MongoDB database-scoped watch for '%s'", scope.database);
+    }
     client = mongoc_client_new(uri);
     if (client == NULL) {
+        mongo_watch_scope_destroy(&scope);
         mongoc_cleanup();
         return scribe_set_error(SCRIBE_EADAPTER, "failed to create MongoDB client");
     }
     err = verify_topology_with_retry(ctx, client);
     if (err != SCRIBE_OK) {
         mongoc_client_destroy(client);
+        mongo_watch_scope_destroy(&scope);
         mongoc_cleanup();
         return err;
     }
@@ -1618,16 +1709,17 @@ scribe_error_t scribe_mongo_watch_bootstrap(scribe_ctx *ctx, const char *uri) {
     if (err == SCRIBE_ENOT_FOUND || !token_is_usable(resume_token)) {
         free(resume_token);
         resume_token = NULL;
-        err = run_bootstrap(ctx, client);
+        err = run_bootstrap(ctx, client, &scope);
         if (err == SCRIBE_OK) {
             err = read_adapter_state(ctx, &resume_token, last_commit);
         }
     }
     if (err == SCRIBE_OK) {
-        err = run_change_stream(ctx, client, &resume_token);
+        err = run_change_stream(ctx, client, &scope, &resume_token);
     }
     free(resume_token);
     mongoc_client_destroy(client);
+    mongo_watch_scope_destroy(&scope);
     mongoc_cleanup();
     return err;
 }
