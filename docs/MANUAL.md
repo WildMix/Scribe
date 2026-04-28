@@ -90,7 +90,7 @@ If `libmongoc` and `libbson` are absent, CMake disables `mongo-watch`. Core comm
 Output:
 
 ```text
-scribe version 1.0.0
+scribe version 1.0.1
 hash_algorithm blake3-256
 pipe_protocol 1
 store .scribe (not initialized)
@@ -206,7 +206,7 @@ tree <64-hex>
 parent <64-hex>
 author	unknown		unknown	<unix-nanos>
 committer	scribe-mongo		scribe	<unix-nanos>
-process	mongo-watch	1.0.0		
+process	mongo-watch	1.0.1	<empty>	<empty>
 
 mongo change stream
 ```
@@ -373,7 +373,7 @@ Prints binary version, hash algorithm, pipe protocol, and repository configurati
 Output:
 
 ```text
-scribe version 1.0.0
+scribe version 1.0.1
 hash_algorithm blake3-256
 pipe_protocol 1
 store .scribe (not initialized)
@@ -509,7 +509,7 @@ commit <64-hex>
 parent <64-hex>
 author unknown <> <unix-nanos>
 committer scribe-mongo <> <unix-nanos>
-process mongo-watch 1.0.0  
+process mongo-watch 1.0.1 <empty> <empty>
 
 mongo change stream
 
@@ -777,7 +777,7 @@ Command after appending `unknown_key=true` to `.scribe/config`:
 Output:
 
 ```text
-scribe version 1.0.0
+scribe version 1.0.1
 hash_algorithm blake3-256
 pipe_protocol 1
 scribe: SCRIBE_ECONFIG: unknown config key 'unknown_key'

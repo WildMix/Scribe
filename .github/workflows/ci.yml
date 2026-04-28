@@ -4,7 +4,35 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  version:
+    name: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version consistency
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake_version=$(sed -nE 's/^project\(scribe VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)
+          header_version=$(sed -nE 's/^#define SCRIBE_VERSION "([^"]+)"/\1/p' include/scribe/scribe.h)
+          if [ -z "$cmake_version" ]; then
+            echo "::error title=Missing CMake version::Could not read project(scribe VERSION ...) from CMakeLists.txt"
+            exit 1
+          fi
+          if [ -z "$header_version" ]; then
+            echo "::error title=Missing header version::Could not read SCRIBE_VERSION from include/scribe/scribe.h"
+            exit 1
+          fi
+          if [ "$cmake_version" != "$header_version" ]; then
+            echo "::error title=Version mismatch::CMakeLists.txt has $cmake_version but SCRIBE_VERSION is $header_version"
+            exit 1
+          fi
+          echo "Scribe version $cmake_version"
+
   build-linux:
     name: build-linux (${{ matrix.os }}, ${{ matrix.cc }}, ${{ matrix.build_type }}, mongo=${{ matrix.mongo }})
     runs-on: ${{ matrix.os }}
@@ -79,3 +107,99 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang-format
       - name: Check formatting
         run: find src include tests -name '*.[ch]' -print0 | xargs -0 clang-format --dry-run --Werror
+
+  quality-gate:
+    name: quality gate
+    runs-on: ubuntu-24.04
+    needs: [version, build-linux, sanitizers, smoke, format]
+    if: always()
+    steps:
+      - name: Check required jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed=0
+          check_result() {
+            job="$1"
+            result="$2"
+            echo "$job: $result"
+            if [ "$result" != "success" ]; then
+              failed=1
+            fi
+          }
+          check_result version "${{ needs.version.result }}"
+          check_result build-linux "${{ needs.build-linux.result }}"
+          check_result sanitizers "${{ needs.sanitizers.result }}"
+          check_result smoke "${{ needs.smoke.result }}"
+          check_result format "${{ needs.format.result }}"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error title=Quality gate failed::One or more required jobs failed, were cancelled, or were skipped"
+            exit 1
+          fi
+          echo "Quality gate passed"
+
+  release:
+    name: release
+    runs-on: ubuntu-24.04
+    needs: quality-gate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Read release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake_version=$(sed -nE 's/^project\(scribe VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)
+          header_version=$(sed -nE 's/^#define SCRIBE_VERSION "([^"]+)"/\1/p' include/scribe/scribe.h)
+          if [ -z "$cmake_version" ] || [ "$cmake_version" != "$header_version" ]; then
+            echo "::error title=Invalid release version::CMakeLists.txt and SCRIBE_VERSION must be present and equal"
+            exit 1
+          fi
+          echo "version=$cmake_version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$cmake_version" >> "$GITHUB_OUTPUT"
+      - name: Check remote tag
+        id: remote_tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          if git ls-remote --exit-code origin "refs/tags/${tag}" "refs/tags/${tag}^{}" > tag.refs 2>/dev/null; then
+            remote_sha=$(awk '$2 ~ /\^\{\}$/ { peeled=$1 } $2 !~ /\^\{\}$/ { direct=$1 } END { print peeled != "" ? peeled : direct }' tag.refs)
+            if [ "$remote_sha" != "$GITHUB_SHA" ]; then
+              echo "::error title=Release tag already exists::$tag points to $remote_sha, not $GITHUB_SHA. Bump the project version before release."
+              exit 1
+            fi
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create tag
+        if: steps.remote_tag.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$tag"
+          git push origin "refs/tags/${tag}"
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists"
+          else
+            gh release create "$tag" --title "Scribe $tag" --notes "Automated release for Scribe $tag."
+          fi
