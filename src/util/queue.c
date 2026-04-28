@@ -1,3 +1,11 @@
+/*
+ * Bounded single-producer/single-consumer queue.
+ *
+ * The queue is used at Scribe's pipe/library boundary where producer and
+ * consumer work should be decoupled without unbounded memory growth. It uses
+ * pthread mutexes and condition variables for clarity and portability rather
+ * than a lock-free implementation.
+ */
 #include "util/queue.h"
 
 #include "util/error.h"
@@ -6,6 +14,11 @@
 #include <stdlib.h>
 #include <time.h>
 
+/*
+ * Allocates the ring buffer and synchronization primitives for a queue. The
+ * stall warning threshold is stored here so push operations can notice when a
+ * full queue has blocked longer than expected.
+ */
 scribe_error_t scribe_spsc_queue_init(scribe_spsc_queue *q, size_t capacity, int stall_warn_seconds) {
     if (q == NULL || capacity == 0) {
         return scribe_set_error(SCRIBE_EINVAL, "invalid queue capacity");
@@ -29,6 +42,10 @@ scribe_error_t scribe_spsc_queue_init(scribe_spsc_queue *q, size_t capacity, int
     return SCRIBE_OK;
 }
 
+/*
+ * Destroys queue synchronization primitives and frees the ring buffer. The
+ * queue does not own queued item pointers, so callers must drain/free items.
+ */
 void scribe_spsc_queue_destroy(scribe_spsc_queue *q) {
     if (q != NULL) {
         pthread_cond_destroy(&q->not_full);
@@ -39,11 +56,20 @@ void scribe_spsc_queue_destroy(scribe_spsc_queue *q) {
     }
 }
 
+/*
+ * Builds an absolute CLOCK_REALTIME deadline seconds in the future for
+ * pthread_cond_timedwait().
+ */
 static void make_deadline(struct timespec *ts, int seconds) {
     clock_gettime(CLOCK_REALTIME, ts);
     ts->tv_sec += seconds;
 }
 
+/*
+ * Pushes one item, blocking while the ring is full. If the configured stall
+ * threshold expires during a full wait, the queue records warned_full so callers
+ * can surface a contextual warning.
+ */
 scribe_error_t scribe_spsc_queue_push(scribe_spsc_queue *q, void *item) {
     if (q == NULL) {
         return scribe_set_error(SCRIBE_EINVAL, "queue is NULL");
@@ -82,6 +108,11 @@ scribe_error_t scribe_spsc_queue_push(scribe_spsc_queue *q, void *item) {
     return SCRIBE_OK;
 }
 
+/*
+ * Pops one item, blocking until an item is available. This is the normal
+ * consumer path when the caller knows the producer will eventually provide
+ * work.
+ */
 scribe_error_t scribe_spsc_queue_pop(scribe_spsc_queue *q, void **out) {
     if (q == NULL || out == NULL) {
         return scribe_set_error(SCRIBE_EINVAL, "invalid queue pop");
@@ -98,6 +129,10 @@ scribe_error_t scribe_spsc_queue_pop(scribe_spsc_queue *q, void **out) {
     return SCRIBE_OK;
 }
 
+/*
+ * Attempts to pop one item without blocking. The return value is boolean: 1
+ * when an item was written to out, 0 when the queue was empty or invalid.
+ */
 int scribe_spsc_queue_try_pop(scribe_spsc_queue *q, void **out) {
     int found = 0;
 

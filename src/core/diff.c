@@ -1,3 +1,11 @@
+/*
+ * Commit revision resolution, log/show output, and tree diffs.
+ *
+ * This file implements the user-facing history commands that compare commit
+ * root trees: log path filtering, show metadata, cat-object pretty output, and
+ * diff. The diff algorithm treats blobs as opaque bytes and reports changes at
+ * Scribe path level.
+ */
 #include "core/internal.h"
 
 #include "util/error.h"
@@ -7,6 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Reads a commit object and parses it into an arena-backed view. The arena must
+ * outlive the returned view because parsed string fields point into arena memory.
+ */
 static scribe_error_t read_commit_view(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE], scribe_arena *arena,
                                        scribe_commit_view *out) {
     scribe_object obj;
@@ -23,6 +35,10 @@ static scribe_error_t read_commit_view(scribe_ctx *ctx, const uint8_t hash[SCRIB
     return err;
 }
 
+/*
+ * Resolves the small v1 revision language to a full commit hash. Supported
+ * forms are HEAD, HEAD~N, and a full 64-character commit hash.
+ */
 scribe_error_t scribe_resolve_commit(scribe_ctx *ctx, const char *rev, uint8_t out[SCRIBE_HASH_SIZE]) {
     if (rev == NULL || strcmp(rev, "HEAD") == 0) {
         return scribe_refs_read(ctx, "refs/heads/main", out);
@@ -78,6 +94,10 @@ typedef struct {
     size_t count;
 } diff_count_state;
 
+/*
+ * Diff visitor that only increments a counter. log --oneline --paths uses it to
+ * append `[N changed]` without printing every changed path.
+ */
 static scribe_error_t count_diff_visit(char status, const char *path, void *user) {
     diff_count_state *state = (diff_count_state *)user;
 
@@ -87,6 +107,10 @@ static scribe_error_t count_diff_visit(char status, const char *path, void *user
     return SCRIBE_OK;
 }
 
+/*
+ * Compares two path-resolution results for log path filtering. A path changed
+ * when it appears, disappears, changes type, or resolves to a different hash.
+ */
 static int path_resolution_changed(const scribe_path_resolution *parent, const scribe_path_resolution *current) {
     /*
      * Path-history filtering compares object identity, not blob contents. A
@@ -103,6 +127,10 @@ static int path_resolution_changed(const scribe_path_resolution *parent, const s
     return scribe_hash_cmp(parent->hash, current->hash) != 0;
 }
 
+/*
+ * Returns the human annotation for path appearance/disappearance. Modifications
+ * return NULL because the command already emits the commit without extra text.
+ */
 static const char *path_change_annotation(const scribe_path_resolution *parent, const scribe_path_resolution *current) {
     if (parent->state == SCRIBE_PATH_ABSENT && current->state != SCRIBE_PATH_ABSENT) {
         return "added";
@@ -113,6 +141,10 @@ static const char *path_change_annotation(const scribe_path_resolution *parent, 
     return NULL;
 }
 
+/*
+ * Counts leaf-level changed paths between two root trees. old_root may be NULL
+ * for an initial commit, in which case every leaf in new_root is counted as added.
+ */
 static scribe_error_t count_changed_paths(scribe_ctx *ctx, const uint8_t *old_root,
                                           const uint8_t new_root[SCRIBE_HASH_SIZE], size_t *out) {
     diff_count_state state;
@@ -127,6 +159,11 @@ static scribe_error_t count_changed_paths(scribe_ctx *ctx, const uint8_t *old_ro
     return SCRIBE_OK;
 }
 
+/*
+ * Implements `scribe log`. It walks the parent chain from HEAD, optionally
+ * filters commits by one path, optionally prints changed paths, and applies -n
+ * to the number of commits emitted rather than the number scanned.
+ */
 scribe_error_t scribe_cli_log(scribe_ctx *ctx, int oneline, size_t limit, int show_paths, const char *path_filter) {
     uint8_t hash[SCRIBE_HASH_SIZE];
     size_t emitted = 0;
@@ -266,6 +303,11 @@ scribe_error_t scribe_cli_log(scribe_ctx *ctx, int oneline, size_t limit, int sh
     return SCRIBE_OK;
 }
 
+/*
+ * Implements `scribe show <commit>` and delegates `scribe show <commit>:<path>`
+ * to the path-inspection implementation. The commit form prints metadata and
+ * diffs the commit against its parent for the changes section.
+ */
 scribe_error_t scribe_cli_show(scribe_ctx *ctx, const char *rev) {
     uint8_t hash[SCRIBE_HASH_SIZE];
     scribe_arena arena;
@@ -313,6 +355,10 @@ scribe_error_t scribe_cli_show(scribe_ctx *ctx, const char *rev) {
     return err;
 }
 
+/*
+ * Converts an object type byte into the label used by cat-object and tree
+ * pretty-printing. Unknown types return "unknown" for diagnostics.
+ */
 static const char *type_name(uint8_t type) {
     if (type == SCRIBE_OBJECT_BLOB) {
         return "blob";
@@ -326,6 +372,10 @@ static const char *type_name(uint8_t type) {
     return "unknown";
 }
 
+/*
+ * Pretty-prints a tree object payload as `<type> <hash>\t<name>` entries. This
+ * is the cat-object -p representation for a raw tree object.
+ */
 static scribe_error_t pretty_tree(scribe_object *obj) {
     scribe_arena arena;
     scribe_tree_entry *entries = NULL;
@@ -354,6 +404,10 @@ static scribe_error_t pretty_tree(scribe_object *obj) {
     return SCRIBE_OK;
 }
 
+/*
+ * Implements `scribe cat-object`. The object is read and verified before the
+ * requested mode prints its type, payload size, or pretty/raw payload contents.
+ */
 scribe_error_t scribe_cli_cat_object(scribe_ctx *ctx, char mode, const char *hex) {
     uint8_t hash[SCRIBE_HASH_SIZE];
     scribe_object obj;
@@ -385,6 +439,10 @@ scribe_error_t scribe_cli_cat_object(scribe_ctx *ctx, char mode, const char *hex
     return err;
 }
 
+/*
+ * Diff visitor that prints one changed path, optionally with an indentation
+ * prefix supplied through the user pointer.
+ */
 static scribe_error_t print_diff_visit(char status, const char *path, void *user) {
     const char *indent = user == NULL ? "" : (const char *)user;
 
@@ -392,6 +450,10 @@ static scribe_error_t print_diff_visit(char status, const char *path, void *user
     return SCRIBE_OK;
 }
 
+/*
+ * Builds a slash-separated child path from an existing prefix and one entry
+ * name. The caller owns the returned heap string.
+ */
 static scribe_error_t join_path(const char *prefix, const char *name, char **out) {
     size_t plen = strlen(prefix);
     size_t nlen = strlen(name);
@@ -423,6 +485,10 @@ static scribe_error_t join_path(const char *prefix, const char *name, char **out
     return SCRIBE_OK;
 }
 
+/*
+ * Reads and parses a tree object for diffing. The arena is reinitialized to a
+ * capacity based on the object payload so large trees can be parsed safely.
+ */
 static scribe_error_t parse_tree_object(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE], scribe_arena *arena,
                                         scribe_tree_entry **entries, size_t *count) {
     scribe_object obj;
@@ -449,6 +515,10 @@ static scribe_error_t parse_tree_object(scribe_ctx *ctx, const uint8_t hash[SCRI
     return err;
 }
 
+/*
+ * Reports every leaf under a blob or tree as added/deleted. This turns subtree
+ * additions/deletions into the leaf-level output users expect from diff/log --paths.
+ */
 static scribe_error_t report_all(scribe_ctx *ctx, char status, const uint8_t hash[SCRIBE_HASH_SIZE], uint8_t type,
                                  const char *path, diff_visit_fn visit, void *user) {
     /*
@@ -495,6 +565,11 @@ static scribe_error_t report_all(scribe_ctx *ctx, char status, const uint8_t has
     return SCRIBE_OK;
 }
 
+/*
+ * Recursively diffs two tree objects using their canonical byte-sorted entry
+ * order. Matching tree entries recurse; matching blob entries with different
+ * hashes report a modification.
+ */
 static scribe_error_t diff_trees(scribe_ctx *ctx, const uint8_t a_hash[SCRIBE_HASH_SIZE],
                                  const uint8_t b_hash[SCRIBE_HASH_SIZE], const char *prefix, diff_visit_fn visit,
                                  void *user) {
@@ -586,6 +661,10 @@ static scribe_error_t diff_trees(scribe_ctx *ctx, const uint8_t a_hash[SCRIBE_HA
     return err;
 }
 
+/*
+ * Diffs two root trees, treating a missing old root as an initial commit where
+ * every leaf in the new root is an added path.
+ */
 static scribe_error_t diff_roots(scribe_ctx *ctx, const uint8_t *old_root, const uint8_t new_root[SCRIBE_HASH_SIZE],
                                  diff_visit_fn visit, void *user) {
     if (visit == NULL) {
@@ -597,6 +676,10 @@ static scribe_error_t diff_roots(scribe_ctx *ctx, const uint8_t *old_root, const
     return diff_trees(ctx, old_root, new_root, "", visit, user);
 }
 
+/*
+ * Implements `scribe diff`. With one revision it compares that commit's parent
+ * to the commit; with two revisions it compares the two resolved root trees.
+ */
 scribe_error_t scribe_cli_diff(scribe_ctx *ctx, const char *a_rev, const char *b_rev) {
     uint8_t a_hash[SCRIBE_HASH_SIZE];
     uint8_t b_hash[SCRIBE_HASH_SIZE];

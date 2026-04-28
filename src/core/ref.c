@@ -1,3 +1,10 @@
+/*
+ * Repository locking and ref updates.
+ *
+ * Scribe v1 has one writable ref, `refs/heads/main`, plus a repository-wide
+ * advisory lock for writers. This module owns the lock file diagnostics, strict
+ * ref-file parsing, and compare-and-swap publication used by commit writers.
+ */
 #include "core/internal.h"
 
 #include "util/error.h"
@@ -11,6 +18,11 @@
 #include <sys/file.h>
 #include <unistd.h>
 
+/*
+ * Acquires the repository writer lock with nonblocking flock(). The lock file
+ * contents are diagnostic only; the open file descriptor and flock state are
+ * the actual mutual exclusion mechanism.
+ */
 scribe_error_t scribe_lock_repo(scribe_ctx *ctx) {
     char *path;
     char diag[256];
@@ -52,6 +64,10 @@ scribe_error_t scribe_lock_repo(scribe_ctx *ctx) {
     return SCRIBE_OK;
 }
 
+/*
+ * Releases the writer lock held by a context, if any. The lock file remains on
+ * disk as a diagnostic artifact, but the flock is gone once the descriptor closes.
+ */
 void scribe_unlock_repo(scribe_ctx *ctx) {
     if (ctx != NULL && ctx->lock_fd >= 0) {
         (void)flock(ctx->lock_fd, LOCK_UN);
@@ -60,8 +76,16 @@ void scribe_unlock_repo(scribe_ctx *ctx) {
     }
 }
 
+/*
+ * Builds the filesystem path for a ref name under the repository root. The
+ * caller owns the returned path.
+ */
 static char *ref_path(scribe_ctx *ctx, const char *name) { return scribe_path_join(ctx->repo_path, name); }
 
+/*
+ * Reads a direct hash ref from disk and parses its canonical 64-hex-plus-newline
+ * format. Malformed refs are reported as corruption because they break history.
+ */
 scribe_error_t scribe_refs_read(scribe_ctx *ctx, const char *name, uint8_t out[SCRIBE_HASH_SIZE]) {
     char *path;
     uint8_t *bytes = NULL;
@@ -93,6 +117,11 @@ scribe_error_t scribe_refs_read(scribe_ctx *ctx, const char *name, uint8_t out[S
     return scribe_hash_from_hex(hex, out);
 }
 
+/*
+ * Atomically publishes a new ref value if the current value still matches the
+ * expected parent hash. Passing expected == NULL means the ref must not exist,
+ * which is how the first commit creates refs/heads/main.
+ */
 scribe_error_t scribe_refs_cas(scribe_ctx *ctx, const char *name, const uint8_t *expected,
                                const uint8_t new_hash[SCRIBE_HASH_SIZE]) {
     uint8_t current[SCRIBE_HASH_SIZE];

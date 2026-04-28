@@ -1,3 +1,11 @@
+/*
+ * Content-addressed object storage.
+ *
+ * Scribe stores blobs, trees, and commits as zstd-compressed loose objects under
+ * `.scribe/objects`. The object hash is BLAKE3 over the uncompressed typed
+ * envelope, so reads can verify both identity and payload framing before higher
+ * layers parse object contents.
+ */
 #include "core/internal.h"
 
 #include "util/error.h"
@@ -15,6 +23,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/*
+ * Hashes an arbitrary byte buffer with BLAKE3-256. Object code uses this for
+ * envelopes and helper code uses the same fixed output size everywhere.
+ */
 static void hash_bytes(const uint8_t *bytes, size_t len, uint8_t out[SCRIBE_HASH_SIZE]) {
     blake3_hasher hasher;
     blake3_hasher_init(&hasher);
@@ -22,6 +34,11 @@ static void hash_bytes(const uint8_t *bytes, size_t len, uint8_t out[SCRIBE_HASH
     blake3_hasher_finalize(&hasher, out, SCRIBE_HASH_SIZE);
 }
 
+/*
+ * Builds the uncompressed object envelope `<type><payload-len><payload>`.
+ * The returned buffer is heap-owned because it is both hashed and compressed
+ * before being written to disk.
+ */
 static scribe_error_t build_envelope(uint8_t type, const uint8_t *payload, size_t payload_len, uint8_t **out,
                                      size_t *out_len) {
     uint8_t leb[10];
@@ -55,6 +72,10 @@ static scribe_error_t build_envelope(uint8_t type, const uint8_t *payload, size_
     return SCRIBE_OK;
 }
 
+/*
+ * Computes the loose-object path for a hash using the v1 two-character fanout
+ * directory layout. The returned string is heap-owned by the caller.
+ */
 char *scribe_object_path(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE]) {
     char hex[SCRIBE_HEX_HASH_SIZE + 1];
     char dirpart[16];
@@ -84,6 +105,10 @@ char *scribe_object_path(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE]) 
     return path;
 }
 
+/*
+ * Checks whether an object file currently exists without reading or verifying
+ * it. Writers use this to make content-addressed writes idempotent.
+ */
 scribe_error_t scribe_object_has(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE]) {
     char *path = scribe_object_path(ctx, hash);
     int exists;
@@ -96,6 +121,11 @@ scribe_error_t scribe_object_has(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH
     return exists ? SCRIBE_OK : scribe_set_error(SCRIBE_ENOT_FOUND, "object not found");
 }
 
+/*
+ * Writes an object if its content-addressed file does not already exist. The
+ * object is enveloped, hashed, compressed, and atomically published under the
+ * loose-object path derived from the hash.
+ */
 scribe_error_t scribe_object_write(scribe_ctx *ctx, uint8_t type, const uint8_t *payload, size_t payload_len,
                                    uint8_t out_hash[SCRIBE_HASH_SIZE]) {
     uint8_t *envelope = NULL;
@@ -182,6 +212,11 @@ scribe_error_t scribe_object_write(scribe_ctx *ctx, uint8_t type, const uint8_t 
     return err;
 }
 
+/*
+ * Reads and verifies one loose object. Verification includes zstd frame
+ * validity, BLAKE3 hash equality, envelope type/length framing, and exact
+ * payload-length accounting.
+ */
 scribe_error_t scribe_object_read(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE], scribe_object *out) {
     char *path;
     uint8_t *compressed = NULL;
@@ -257,6 +292,10 @@ scribe_error_t scribe_object_read(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HAS
     return SCRIBE_OK;
 }
 
+/*
+ * Releases the envelope buffer owned by a read object and clears all object
+ * fields so accidental reuse is easier to notice during debugging.
+ */
 void scribe_object_free(scribe_object *obj) {
     if (obj != NULL) {
         free(obj->envelope);
@@ -264,8 +303,15 @@ void scribe_object_free(scribe_object *obj) {
     }
 }
 
+/*
+ * Returns whether a character is valid lowercase hex for object path names.
+ */
 static int is_hex_char(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }
 
+/*
+ * Validates a string slice as lowercase hex without requiring it to be
+ * NUL-terminated. Object iteration uses this for fanout directories and file names.
+ */
 static int is_hex_string(const char *s, size_t len) {
     size_t i;
 
@@ -286,6 +332,11 @@ typedef struct {
     char dir_hex[3];
 } object_file_iter;
 
+/*
+ * Visits one file name inside an object fanout directory. Only names that look
+ * like the remaining 62 hex characters of a loose object are converted to a
+ * hash and passed to the caller's visitor.
+ */
 static scribe_error_t visit_object_file(const char *name, void *vctx) {
     object_file_iter *it = (object_file_iter *)vctx;
     char hex[SCRIBE_HEX_HASH_SIZE + 1];
@@ -294,10 +345,8 @@ static scribe_error_t visit_object_file(const char *name, void *vctx) {
 
     /*
      * Ignore files that do not look like loose object names. Operators may
-     * leave editor temp files or
-     * filesystem metadata in objects/; those should
-     * not break iteration. A file that has a valid object-shaped
-     * name but bad
+     * leave editor temp files or filesystem metadata in objects/; those should
+     * not break iteration. A file that has a valid object-shaped name but bad
      * contents will still fail later when the visitor reads it.
      */
     if (strlen(name) != 62u || !is_hex_string(name, 62u)) {
@@ -317,6 +366,10 @@ typedef struct {
     void *user;
 } object_dir_iter;
 
+/*
+ * Visits one fanout directory under objects/. Valid two-character hex
+ * directories are opened and their files are delegated to visit_object_file().
+ */
 static scribe_error_t visit_object_dir(const char *name, void *vctx) {
     object_dir_iter *it = (object_dir_iter *)vctx;
     object_file_iter file_it;
@@ -346,6 +399,11 @@ static scribe_error_t visit_object_dir(const char *name, void *vctx) {
     return err == SCRIBE_ENOT_FOUND ? SCRIBE_OK : err;
 }
 
+/*
+ * Iterates every loose object hash known to the object store. The iterator uses
+ * the storage abstraction rather than exposing filesystem walking to callers so
+ * future pack storage can replace this implementation behind the same API.
+ */
 scribe_error_t scribe_object_iter(scribe_ctx *ctx, scribe_object_visit_fn visit, void *user) {
     object_dir_iter it;
     char *objects;
@@ -366,6 +424,10 @@ scribe_error_t scribe_object_iter(scribe_ctx *ctx, scribe_object_visit_fn visit,
     return err == SCRIBE_ENOT_FOUND ? SCRIBE_OK : err;
 }
 
+/*
+ * Returns the compressed on-disk byte size of a loose object. list-objects uses
+ * this only when the user requests the `%C` format placeholder.
+ */
 scribe_error_t scribe_object_compressed_size(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE], size_t *out) {
     struct stat st;
     char *path;

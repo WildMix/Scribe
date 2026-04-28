@@ -1,3 +1,11 @@
+/*
+ * Canonical tree object serialization and parsing.
+ *
+ * Tree objects map entry names to child object hashes. The serialized payload is
+ * byte-sorted by entry name and rejects duplicates, which makes identical
+ * logical directory trees hash identically and lets diff/log use deterministic
+ * merge walks.
+ */
 #include "core/internal.h"
 
 #include "util/error.h"
@@ -6,6 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Compares two tree entries by raw name bytes, then by length when one name is
+ * a prefix of the other. This defines the canonical storage order for trees.
+ */
 static int entry_cmp(const void *a, const void *b) {
     const scribe_tree_entry *ea = (const scribe_tree_entry *)a;
     const scribe_tree_entry *eb = (const scribe_tree_entry *)b;
@@ -23,6 +35,11 @@ static int entry_cmp(const void *a, const void *b) {
     return 0;
 }
 
+/*
+ * Serializes an entry array into the canonical tree payload. The caller may
+ * provide entries in any order; this function sorts a copy, validates names and
+ * types, rejects duplicates, and writes the compact binary entry sequence.
+ */
 scribe_error_t scribe_tree_serialize(const scribe_tree_entry *entries, size_t count, scribe_arena *arena, uint8_t **out,
                                      size_t *out_len) {
     scribe_tree_entry *sorted;
@@ -36,8 +53,7 @@ scribe_error_t scribe_tree_serialize(const scribe_tree_entry *entries, size_t co
     }
     /*
      * Tree objects are canonical: callers may provide entries in any order, but
-     * the serialized payload is
-     * sorted byte-for-byte by name and rejects
+     * the serialized payload is sorted byte-for-byte by name and rejects
      * duplicates. This makes identical logical trees hash identically and keeps
      * diff/log walks deterministic.
      */
@@ -89,6 +105,11 @@ scribe_error_t scribe_tree_serialize(const scribe_tree_entry *entries, size_t co
     return SCRIBE_OK;
 }
 
+/*
+ * Returns a conservative arena capacity for parsing a tree payload. The parser
+ * needs entry structs plus NUL-terminated name copies, so callers use this
+ * helper to avoid under-sizing fixed arenas.
+ */
 scribe_error_t scribe_tree_parse_arena_capacity(size_t payload_len, size_t *out) {
     if (out == NULL) {
         return scribe_set_error(SCRIBE_EINVAL, "invalid tree parse arena capacity output");
@@ -98,16 +119,19 @@ scribe_error_t scribe_tree_parse_arena_capacity(size_t payload_len, size_t *out)
     }
     /*
      * Parsing creates an array of entries and copies every name into the arena.
-     * The exact count is not
-     * known without parsing, so callers use this
-     * conservative bound to avoid the fixed-size arena exhaustion
-     * bugs that
+     * The exact count is not known without parsing, so callers use this
+     * conservative bound to avoid the fixed-size arena exhaustion bugs that
      * large collections previously exposed.
      */
     *out = payload_len * 8u + 4096u;
     return SCRIBE_OK;
 }
 
+/*
+ * Parses a canonical tree payload into arena-owned entry views. It verifies
+ * entry framing, child types, nonempty names, and strict byte-sorted ordering so
+ * corrupt or duplicate tree entries are rejected at the boundary.
+ */
 scribe_error_t scribe_tree_parse(const uint8_t *payload, size_t len, scribe_arena *arena,
                                  scribe_tree_entry **out_entries, size_t *out_count) {
     size_t off = 0;
@@ -161,10 +185,8 @@ scribe_error_t scribe_tree_parse(const uint8_t *payload, size_t len, scribe_aren
         off += entries[count].name_len;
         /*
          * Because serialized trees must be strictly sorted, a repeated name or
-         * out-of-order entry
-         * is corrupt. Enforcing this during parse lets later
-         * code use simple merge walks without defensive
-         * duplicate resolution.
+         * out-of-order entry is corrupt. Enforcing this during parse lets later
+         * code use simple merge walks without defensive duplicate resolution.
          */
         if (count > 0 && entry_cmp(&entries[count - 1u], &entries[count]) >= 0) {
             return scribe_set_error(SCRIBE_ECORRUPT, "tree entries are not strictly sorted");

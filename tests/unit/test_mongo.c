@@ -1,9 +1,19 @@
+/*
+ * Unit tests for MongoDB canonicalization helpers.
+ *
+ * These tests do not connect to MongoDB. They verify that BSON/Extended JSON
+ * conversion produces deterministic bytes and document-id path components.
+ */
 #include "adapter_mongo/mongo_internal.h"
 #include "unity.h"
 
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Verifies recursive object-key sorting for canonical Extended JSON input,
+ * including keys inside objects nested in arrays.
+ */
 void test_mongo_canonical_json_sorts_keys(void) {
     char *out = NULL;
     size_t out_len = 0;
@@ -15,6 +25,10 @@ void test_mongo_canonical_json_sorts_keys(void) {
     free(out);
 }
 
+/*
+ * Verifies BSON-to-canonical-JSON conversion and extraction of the canonical
+ * `_id` value used as a Mongo document tree leaf.
+ */
 void test_mongo_canonical_bson_and_id(void) {
     bson_t doc;
     bson_t child;

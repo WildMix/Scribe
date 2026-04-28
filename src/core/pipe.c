@@ -1,3 +1,11 @@
+/*
+ * Pipe protocol v1 parser and commit driver.
+ *
+ * `scribe commit-batch` reads a hybrid text/binary stream from stdin, turns each
+ * BATCH frame into a scribe_change_batch, sends it through the configured SPSC
+ * queue path, and writes an OK/ERR protocol response. The parser owns all heap
+ * memory for a parsed batch and frees it after the commit attempt.
+ */
 #include "core/internal.h"
 
 #include "util/error.h"
@@ -9,6 +17,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Removes one trailing newline from a line read by getline(). The pipe protocol
+ * treats newline as a frame delimiter, not as part of header fields.
+ */
 static void strip_lf(char *line) {
     size_t len = strlen(line);
     if (len != 0 && line[len - 1u] == '\n') {
@@ -16,6 +28,10 @@ static void strip_lf(char *line) {
     }
 }
 
+/*
+ * Splits one mutable protocol line into tab-separated fields. Tabs are replaced
+ * with NUL bytes so the parser can compare fields without allocating substrings.
+ */
 static size_t split_tabs(char *line, char **parts, size_t max_parts) {
     size_t count = 0;
     char *p = line;
@@ -33,6 +49,10 @@ static size_t split_tabs(char *line, char **parts, size_t max_parts) {
     return count;
 }
 
+/*
+ * Parses an unsigned decimal field used for event counts, path depths, message
+ * byte lengths, and payload byte lengths.
+ */
 static scribe_error_t parse_size_field(const char *s, size_t *out) {
     char *end = NULL;
     unsigned long v = strtoul(s, &end, 10);
@@ -43,6 +63,10 @@ static scribe_error_t parse_size_field(const char *s, size_t *out) {
     return SCRIBE_OK;
 }
 
+/*
+ * Parses the signed nanosecond timestamp field from a TIMESTAMP line. The value
+ * is stored as int64_t because commit metadata uses Unix nanoseconds.
+ */
 static scribe_error_t parse_i64_field(const char *s, int64_t *out) {
     char *end = NULL;
     long long v = strtoll(s, &end, 10);
@@ -53,6 +77,10 @@ static scribe_error_t parse_i64_field(const char *s, int64_t *out) {
     return SCRIBE_OK;
 }
 
+/*
+ * Reads one newline-delimited protocol line and strips the newline. EOF before
+ * a complete frame is a protocol error, not a normal successful end.
+ */
 static scribe_error_t read_line(FILE *in, char **line, size_t *cap) {
     ssize_t n = getline(line, cap, in);
     if (n < 0) {
@@ -63,6 +91,10 @@ static scribe_error_t read_line(FILE *in, char **line, size_t *cap) {
     return SCRIBE_OK;
 }
 
+/*
+ * Reads exactly len bytes of binary message or payload data. Short reads are
+ * treated as truncated protocol frames.
+ */
 static scribe_error_t read_exact(FILE *in, uint8_t *buf, size_t len) {
     size_t got = fread(buf, 1, len, in);
     if (got != len) {
@@ -71,6 +103,10 @@ static scribe_error_t read_exact(FILE *in, uint8_t *buf, size_t len) {
     return SCRIBE_OK;
 }
 
+/*
+ * Frees every allocation owned by a parsed batch. It also frees partially parsed
+ * batches, so parse_one_batch() can use one cleanup path after any error.
+ */
 static void free_batch(scribe_change_batch *batch) {
     size_t i;
 
@@ -100,6 +136,10 @@ static void free_batch(scribe_change_batch *batch) {
     free((void *)batch->message);
 }
 
+/*
+ * Copies AUTHOR or COMMITTER fields into an identity struct. The parsed line is
+ * reused for subsequent reads, so the identity needs independent heap strings.
+ */
 static scribe_error_t parse_identity(char **parts, scribe_identity *id) {
     id->name = strdup(parts[1]);
     id->email = strdup(parts[2]);
@@ -110,6 +150,10 @@ static scribe_error_t parse_identity(char **parts, scribe_identity *id) {
     return SCRIBE_OK;
 }
 
+/*
+ * Copies PROCESS fields into a process-info struct. Empty params and
+ * correlation-id fields are preserved as allocated empty strings.
+ */
 static scribe_error_t parse_process(char **parts, scribe_process_info *process) {
     process->name = strdup(parts[1]);
     process->version = strdup(parts[2]);
@@ -122,6 +166,11 @@ static scribe_error_t parse_process(char **parts, scribe_process_info *process) 
     return SCRIBE_OK;
 }
 
+/*
+ * Parses one complete BATCH frame after the caller has already read the BATCH
+ * line. The resulting batch owns heap memory for identities, process metadata,
+ * message bytes, paths, and payload bytes.
+ */
 static scribe_error_t parse_one_batch(FILE *in, char *first_line, scribe_change_batch *batch) {
     char *line = NULL;
     size_t cap = 0;
@@ -134,12 +183,10 @@ static scribe_error_t parse_one_batch(FILE *in, char *first_line, scribe_change_
 
     /*
      * The pipe protocol is a hybrid text/binary frame. Header lines and path
-     * components are
-     * newline-delimited text, but message and payload bytes are
-     * read by exact byte count. That lets adapters
-     * send arbitrary blob bytes
+     * components are newline-delimited text, but message and payload bytes are
+     * read by exact byte count. That lets adapters send arbitrary blob bytes
      * without escaping them, while keeping framing easy to debug with a terminal.
- */
+     */
     memset(batch, 0, sizeof(*batch));
     if (split_tabs(first_line, parts, 3u) != 3u || strcmp(parts[0], "BATCH") != 0) {
         return scribe_set_error(SCRIBE_EPROTOCOL, "expected BATCH line");
@@ -298,6 +345,10 @@ done:
     return err;
 }
 
+/*
+ * Writes the pipe ERR response for a failed frame. The detail length is printed
+ * before the detail bytes so a caller can parse diagnostics without guessing.
+ */
 static void write_error(FILE *out, scribe_error_t err) {
     const char *detail = scribe_last_error_detail();
     size_t len = strlen(detail);
@@ -309,14 +360,17 @@ static void write_error(FILE *out, scribe_error_t err) {
     fflush(out);
 }
 
+/*
+ * Sends a parsed batch through the SPSC queue before committing it. This keeps
+ * the CLI path exercising the same queue abstraction used by library/adapter
+ * integrations instead of bypassing it with a direct commit call.
+ */
 static scribe_error_t commit_via_queue(scribe_ctx *ctx, scribe_change_batch *batch,
                                        uint8_t commit_hash[SCRIBE_HASH_SIZE]) {
     /*
      * The CLI is single-process, but this still routes the batch through the
-     * same SPSC queue abstraction
-     * used by library/adapter paths. That keeps the
-     * pipe command exercising queue behavior instead of calling
-     * the commit
+     * same SPSC queue abstraction used by library/adapter paths. That keeps the
+     * pipe command exercising queue behavior instead of calling the commit
      * builder directly.
      */
     scribe_spsc_queue q;
@@ -337,16 +391,19 @@ static scribe_error_t commit_via_queue(scribe_ctx *ctx, scribe_change_batch *bat
     return err;
 }
 
+/*
+ * Reads zero or more BATCH frames from stdin and commits each valid frame. A
+ * malformed frame stops the stream immediately because the remaining bytes may
+ * be binary payload data that cannot be safely resynchronized.
+ */
 scribe_error_t scribe_pipe_commit_batch(scribe_ctx *ctx, FILE *in, FILE *out) {
     char *line = NULL;
     size_t cap = 0;
 
     /*
      * Accept multiple BATCH frames on one stdin stream. Each successful frame
-     * commits independently and
-     * emits its own OK line. The first malformed frame
-     * emits ERR and stops; continuing after malformed framing
-     * would risk reading
+     * commits independently and emits its own OK line. The first malformed frame
+     * emits ERR and stops; continuing after malformed framing would risk reading
      * binary payload bytes as protocol lines.
      */
     while (getline(&line, &cap, in) >= 0) {

@@ -1,3 +1,11 @@
+/*
+ * Repository lifecycle management.
+ *
+ * This file owns initialization of the `.scribe/` directory skeleton and the
+ * open/close path shared by every command. Opening a context loads config,
+ * configures logging, and optionally acquires the writer lock before higher
+ * layers touch refs or objects.
+ */
 #include "core/internal.h"
 
 #include "util/error.h"
@@ -6,6 +14,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Creates a new repository skeleton at path. The function writes HEAD, config,
+ * log, objects/, refs/heads/, and adapter-state/, but deliberately leaves
+ * refs/heads/main absent until the first commit publishes history.
+ */
 scribe_error_t scribe_init_repository(const char *path) {
     scribe_config cfg;
     char *objects;
@@ -63,6 +76,11 @@ scribe_error_t scribe_init_repository(const char *path) {
     return SCRIBE_OK;
 }
 
+/*
+ * Opens an existing repository context. Writable opens take the repository lock
+ * before returning; read-only opens skip the lock because immutable objects and
+ * atomic refs make concurrent inspection safe.
+ */
 scribe_error_t scribe_open(const char *path, int writable, scribe_ctx **out) {
     scribe_ctx *ctx;
     scribe_error_t err;
@@ -113,6 +131,11 @@ scribe_error_t scribe_open(const char *path, int writable, scribe_ctx **out) {
     return SCRIBE_OK;
 }
 
+/*
+ * Releases every resource owned by a context: log file, lock, repository path,
+ * and the context allocation itself. It accepts NULL so cleanup paths can call
+ * it after partial-open failures.
+ */
 void scribe_close(scribe_ctx *ctx) {
     if (ctx == NULL) {
         return;

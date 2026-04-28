@@ -1,3 +1,10 @@
+/*
+ * Scribe command-line frontend.
+ *
+ * This file parses top-level CLI arguments, opens repository contexts with the
+ * correct read/write mode, dispatches to core command implementations, and turns
+ * Scribe errors into the consistent `scribe: SYMBOL: detail` diagnostic format.
+ */
 #include "core/internal.h"
 
 #include "util/error.h"
@@ -11,6 +18,11 @@
 #include "adapter_mongo/mongo_adapter.h"
 #endif
 
+/*
+ * Prints the command summary used for invalid arguments and --help. The help
+ * text intentionally includes operational notes for list-objects because its
+ * ordering and `%C` cost can surprise users.
+ */
 static void usage(FILE *out) {
     fprintf(out, "usage: scribe [--store <path>] <command> [args]\n"
                  "\n"
@@ -30,15 +42,27 @@ static void usage(FILE *out) {
                  "  mongo-watch <uri>\n");
 }
 
+/*
+ * Prints the most recent Scribe error detail and returns the numeric error code
+ * as a process exit status.
+ */
 static int fail(scribe_error_t err) {
     fprintf(stderr, "scribe: %s: %s\n", scribe_error_symbol(err), scribe_last_error_detail());
     return (int)err;
 }
 
+/*
+ * Thin wrapper around scribe_open(). Keeping command dispatch through one helper
+ * makes it easy to adjust context-opening policy later.
+ */
 static scribe_error_t open_ctx(const char *store, int writable, scribe_ctx **ctx) {
     return scribe_open(store, writable, ctx);
 }
 
+/*
+ * Implements `scribe info`. It prints binary-level facts even when the store is
+ * missing, then prints repository settings only if the store opens successfully.
+ */
 static int cmd_info(const char *store) {
     scribe_ctx *ctx = NULL;
     scribe_error_t err = scribe_open(store, 0, &ctx);
@@ -60,6 +84,11 @@ static int cmd_info(const char *store) {
     return fail(err);
 }
 
+/*
+ * Parses global options, dispatches subcommands, and owns all CLI context
+ * lifetimes. Each command opens the repository in the narrowest mode it needs:
+ * writable for commit-producing commands and read-only for inspection commands.
+ */
 int main(int argc, char **argv) {
     const char *store = ".scribe";
     const char *cmd;

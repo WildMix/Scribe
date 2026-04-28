@@ -1,3 +1,11 @@
+/*
+ * MongoDB BSON and Extended JSON canonicalization.
+ *
+ * The Mongo adapter stores documents as canonical Extended JSON blobs and uses
+ * the canonical Extended JSON representation of `_id` as the leaf tree name.
+ * libbson provides Extended JSON rendering; this file adds recursive object-key
+ * sorting and whitespace removal so equivalent documents hash deterministically.
+ */
 #include "adapter_mongo/mongo_internal.h"
 
 #include "util/error.h"
@@ -43,17 +51,29 @@ typedef struct {
     size_t cap;
 } sbuf;
 
+/*
+ * Advances the parser past JSON whitespace. The serializer does not preserve
+ * insignificant whitespace, so whitespace only matters between parsed tokens.
+ */
 static void skip_ws(parser *p) {
     while (p->pos < p->len && isspace((unsigned char)p->s[p->pos])) {
         p->pos++;
     }
 }
 
+/*
+ * Copies a byte range into parser arena memory and appends a NUL terminator.
+ * JSON value nodes keep raw spellings as strings owned by the parser arena.
+ */
 static char *arena_copy(scribe_arena *arena, const char *s, size_t len) {
     char *out = scribe_arena_strdup_len(arena, s, len);
     return out;
 }
 
+/*
+ * Allocates a JSON AST node in the parser arena and initializes its kind. Nodes
+ * are freed all at once when the parser arena is destroyed.
+ */
 static json_value *new_value(parser *p, json_kind kind) {
     json_value *v = (json_value *)scribe_arena_alloc(&p->arena, sizeof(*v), _Alignof(json_value));
     if (v != NULL) {
@@ -63,6 +83,11 @@ static json_value *new_value(parser *p, json_kind kind) {
     return v;
 }
 
+/*
+ * Produces the decoded key bytes used for object-key sorting. This is not a full
+ * JSON string unescaper for values; it exists only to compare object member
+ * names deterministically.
+ */
 static scribe_error_t decode_json_string(parser *p, const char *raw, size_t raw_len, char **out) {
     char *decoded;
     size_t off = 1;
@@ -114,6 +139,10 @@ static scribe_error_t decode_json_string(parser *p, const char *raw, size_t raw_
 
 static scribe_error_t parse_value(parser *p, json_value **out);
 
+/*
+ * Parses a quoted JSON string and preserves its raw spelling. Keeping the raw
+ * spelling lets serialization avoid changing string escape choices in values.
+ */
 static scribe_error_t parse_string_value(parser *p, json_value **out) {
     size_t start = p->pos;
     int escaped = 0;
@@ -149,6 +178,10 @@ static scribe_error_t parse_string_value(parser *p, json_value **out) {
     return scribe_set_error(SCRIBE_EMALFORMED, "unterminated JSON string");
 }
 
+/*
+ * Grows the arena-owned child pointer array for a JSON array node. Arena growth
+ * is copy-on-grow because previous arena allocations are not individually freed.
+ */
 static scribe_error_t grow_items(parser *p, json_value ***items, size_t *cap, size_t count) {
     json_value **grown;
     size_t new_cap = *cap == 0 ? 8u : *cap * 2u;
@@ -168,6 +201,10 @@ static scribe_error_t grow_items(parser *p, json_value ***items, size_t *cap, si
     return SCRIBE_OK;
 }
 
+/*
+ * Grows the arena-owned key/value pair array for a JSON object node. The object
+ * parser later sorts this array in place by decoded key.
+ */
 static scribe_error_t grow_pairs(parser *p, json_pair **pairs, size_t *cap, size_t count) {
     json_pair *grown;
     size_t new_cap = *cap == 0 ? 8u : *cap * 2u;
@@ -187,6 +224,10 @@ static scribe_error_t grow_pairs(parser *p, json_pair **pairs, size_t *cap, size
     return SCRIBE_OK;
 }
 
+/*
+ * Parses a JSON array, preserving item order exactly. RFC 8785-style
+ * canonicalization sorts object keys but never reorders arrays.
+ */
 static scribe_error_t parse_array(parser *p, json_value **out) {
     json_value *v = new_value(p, JSON_ARRAY);
     size_t cap = 0;
@@ -227,12 +268,21 @@ static scribe_error_t parse_array(parser *p, json_value **out) {
     return scribe_set_error(SCRIBE_EMALFORMED, "unterminated JSON array");
 }
 
+/*
+ * qsort comparator for object members. It compares decoded key bytes so escaped
+ * keys sort by their actual key spelling as far as this v1 parser supports.
+ */
 static int pair_cmp(const void *a, const void *b) {
     const json_pair *pa = (const json_pair *)a;
     const json_pair *pb = (const json_pair *)b;
     return strcmp(pa->key_decoded, pb->key_decoded);
 }
 
+/*
+ * Parses a JSON object and sorts its members by decoded key before returning.
+ * Values are parsed recursively, which gives deterministic key order at every
+ * object nesting level.
+ */
 static scribe_error_t parse_object(parser *p, json_value **out) {
     json_value *v = new_value(p, JSON_OBJECT);
     size_t cap = 0;
@@ -295,6 +345,10 @@ static scribe_error_t parse_object(parser *p, json_value **out) {
     return scribe_set_error(SCRIBE_EMALFORMED, "unterminated JSON object");
 }
 
+/*
+ * Parses a non-string, non-container JSON token such as a number, boolean, or
+ * null. The raw token spelling is preserved for serialization.
+ */
 static scribe_error_t parse_atom(parser *p, json_value **out) {
     size_t start = p->pos;
     json_value *v;
@@ -321,6 +375,10 @@ static scribe_error_t parse_atom(parser *p, json_value **out) {
     return SCRIBE_OK;
 }
 
+/*
+ * Dispatches to the appropriate value parser after skipping leading whitespace.
+ * This is the recursive entry point for arrays and objects.
+ */
 static scribe_error_t parse_value(parser *p, json_value **out) {
     skip_ws(p);
     if (p->pos >= p->len) {
@@ -338,6 +396,11 @@ static scribe_error_t parse_value(parser *p, json_value **out) {
     return parse_atom(p, out);
 }
 
+/*
+ * Ensures the serializer buffer has room for extra bytes plus a trailing NUL.
+ * The buffer is heap-owned because canonical JSON is returned to callers after
+ * the parse arena is destroyed.
+ */
 static scribe_error_t sb_grow(sbuf *b, size_t extra) {
     char *grown;
     size_t new_cap;
@@ -358,6 +421,10 @@ static scribe_error_t sb_grow(sbuf *b, size_t extra) {
     return SCRIBE_OK;
 }
 
+/*
+ * Appends raw bytes to the serializer buffer and keeps it NUL-terminated for
+ * convenience. out_len still reports the exact byte length.
+ */
 static scribe_error_t sb_append(sbuf *b, const char *s, size_t len) {
     scribe_error_t err = sb_grow(b, len + 1u);
     if (err != SCRIBE_OK) {
@@ -369,6 +436,11 @@ static scribe_error_t sb_append(sbuf *b, const char *s, size_t len) {
     return SCRIBE_OK;
 }
 
+/*
+ * Serializes a parsed JSON value with no insignificant whitespace. Object pairs
+ * are already sorted by parse_object(), while arrays and raw values keep their
+ * parsed order/spelling.
+ */
 static scribe_error_t serialize_value(const json_value *v, sbuf *b) {
     size_t i;
     scribe_error_t err;
@@ -405,6 +477,10 @@ static scribe_error_t serialize_value(const json_value *v, sbuf *b) {
     return sb_append(b, "}", 1);
 }
 
+/*
+ * Canonicalizes a libbson-style Extended JSON string. The output buffer is
+ * heap-owned, has no insignificant whitespace, and has recursively sorted object keys.
+ */
 scribe_error_t scribe_mongo_canonicalize_json(const char *json, char **out, size_t *out_len) {
     parser p;
     json_value *root = NULL;
@@ -448,6 +524,10 @@ scribe_error_t scribe_mongo_canonicalize_json(const char *json, char **out, size
     return SCRIBE_OK;
 }
 
+/*
+ * Converts a BSON document to libbson canonical Extended JSON and then applies
+ * Scribe's deterministic key sorting. The returned bytes become blob payloads.
+ */
 scribe_error_t scribe_mongo_canonicalize_bson(const bson_t *doc, uint8_t **out, size_t *out_len) {
     char *json;
     size_t canonical_len = 0;
@@ -468,6 +548,10 @@ scribe_error_t scribe_mongo_canonicalize_bson(const bson_t *doc, uint8_t **out, 
     return SCRIBE_OK;
 }
 
+/*
+ * Extracts `_id`, canonicalizes that BSON value, and returns the canonical JSON
+ * value text used as the document leaf name in Scribe's Mongo tree shape.
+ */
 scribe_error_t scribe_mongo_canonicalize_id(const bson_t *doc, char **out) {
     bson_iter_t iter;
     bson_t tmp;

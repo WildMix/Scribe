@@ -1,3 +1,10 @@
+/*
+ * Unit tests for core Scribe utilities and repository behavior.
+ *
+ * These tests exercise low-level encoders, hash helpers, arena allocation,
+ * canonical tree serialization, the SPSC queue, repository commits, fsck, the
+ * pipe protocol, and object iteration without requiring MongoDB.
+ */
 #include "core/internal.h"
 #include "util/arena.h"
 #include "util/hex.h"
@@ -9,6 +16,10 @@
 #include <string.h>
 #include <unistd.h>
 
+/*
+ * Verifies representative unsigned integers round-trip through the LEB128
+ * encoder/decoder and that the decoder reports exactly the bytes consumed.
+ */
 void test_leb128_round_trip(void) {
     uint64_t values[] = {0, 1, 127, 128, 255, 16384, UINT64_C(0xffffffff), UINT64_MAX};
     size_t i;
@@ -24,6 +35,10 @@ void test_leb128_round_trip(void) {
     }
 }
 
+/*
+ * Verifies that the LEB128 decoder rejects encodings that exceed the 10-byte
+ * maximum for uint64_t values.
+ */
 void test_leb128_rejects_overlong(void) {
     uint8_t overlong[11];
     uint64_t decoded = 0;
@@ -33,6 +48,10 @@ void test_leb128_rejects_overlong(void) {
     TEST_ASSERT_EQUAL(SCRIBE_ECORRUPT, scribe_leb128_decode(overlong, sizeof(overlong), &decoded, &used));
 }
 
+/*
+ * Verifies canonical lowercase hash rendering and parsing, plus rejection of an
+ * invalid hash string.
+ */
 void test_hex_round_trip(void) {
     uint8_t hash[SCRIBE_HASH_SIZE];
     uint8_t parsed[SCRIBE_HASH_SIZE];
@@ -49,6 +68,10 @@ void test_hex_round_trip(void) {
     TEST_ASSERT_EQUAL(SCRIBE_EHASH, scribe_hash_from_hex("ABC", parsed));
 }
 
+/*
+ * Verifies arena allocation alignment and reset behavior. Reset should make the
+ * next allocation reuse the same backing space.
+ */
 void test_arena_alloc_reset(void) {
     scribe_arena arena;
     void *a;
@@ -64,6 +87,10 @@ void test_arena_alloc_reset(void) {
     scribe_arena_destroy(&arena);
 }
 
+/*
+ * Verifies that tree serialization sorts entries by name and that parsing
+ * preserves that canonical order.
+ */
 void test_tree_serialization_is_sorted(void) {
     scribe_arena arena;
     scribe_tree_entry entries[2];
@@ -92,6 +119,10 @@ void test_tree_serialization_is_sorted(void) {
     scribe_arena_destroy(&arena);
 }
 
+/*
+ * Verifies FIFO behavior of the queue's nonblocking pop path after two blocking
+ * pushes into a small queue.
+ */
 void test_queue_fifo_try_pop(void) {
     scribe_spsc_queue q;
     int a = 1;
@@ -109,11 +140,18 @@ void test_queue_fifo_try_pop(void) {
     scribe_spsc_queue_destroy(&q);
 }
 
+/*
+ * Creates a temporary repository directory in place from an mkdtemp template.
+ */
 static void make_temp_repo(char *tmpl) {
     char *created = mkdtemp(tmpl);
     TEST_ASSERT_NOT_NULL(created);
 }
 
+/*
+ * Creates a repository, writes two commits that modify the same path, and runs
+ * fsck to verify the resulting object graph.
+ */
 void test_repository_commit_and_fsck(void) {
     char tmpl[] = "/tmp/scribe-test-XXXXXX";
     char *repo;
@@ -167,6 +205,10 @@ void test_repository_commit_and_fsck(void) {
     scribe_close(ctx);
 }
 
+/*
+ * Feeds a real pipe protocol BATCH frame through scribe_pipe_commit_batch() and
+ * checks that the command protocol returns an OK line.
+ */
 void test_pipe_commit_batch(void) {
     char tmpl[] = "/tmp/scribe-pipe-test-XXXXXX";
     const char input[] = "BATCH\t1\t1\n"
@@ -210,6 +252,10 @@ typedef struct {
     int saw_expected;
 } object_iter_test_state;
 
+/*
+ * Object-iterator callback used by the iterator test. It counts all visited
+ * hashes and records whether the expected loose object appeared.
+ */
 static scribe_error_t count_object_visit(const uint8_t hash[SCRIBE_HASH_SIZE], void *user) {
     object_iter_test_state *state = (object_iter_test_state *)user;
 
@@ -220,6 +266,10 @@ static scribe_error_t count_object_visit(const uint8_t hash[SCRIBE_HASH_SIZE], v
     return SCRIBE_OK;
 }
 
+/*
+ * Writes one loose blob without publishing a commit and verifies that the object
+ * iterator and compressed-size query can see it.
+ */
 void test_object_iterator_and_compressed_size(void) {
     char tmpl[] = "/tmp/scribe-object-iter-test-XXXXXX";
     scribe_ctx *ctx = NULL;

@@ -1,3 +1,11 @@
+/*
+ * Commit payload serialization and parsing.
+ *
+ * Scribe commit objects are human-readable text headers plus raw message bytes.
+ * This file validates commit batch metadata, serializes commit payloads, and
+ * parses commit objects into arena-backed views used by log, diff, fsck, and
+ * adapter code.
+ */
 #include "core/internal.h"
 
 #include "util/error.h"
@@ -8,6 +16,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Checks whether a string field is unusable in a line-oriented commit header.
+ * Required fields must be present and nonempty; all fields reject tabs/newlines
+ * because those bytes are structural separators in the commit payload.
+ */
 static int invalid_field(const char *s, int required) {
     if (s == NULL) {
         return required;
@@ -18,6 +31,11 @@ static int invalid_field(const char *s, int required) {
     return strchr(s, '\n') != NULL || strchr(s, '\t') != NULL;
 }
 
+/*
+ * Validates the semantic shape of a change batch before it can become a commit.
+ * The allow_empty flag is used only for bootstrap commits, where the snapshot
+ * root already contains the state and no individual change events are recorded.
+ */
 static scribe_error_t validate_batch(const scribe_change_batch *batch, int allow_empty) {
     size_t i;
 
@@ -61,6 +79,11 @@ static scribe_error_t validate_batch(const scribe_change_batch *batch, int allow
     return SCRIBE_OK;
 }
 
+/*
+ * Appends formatted text into an existing fixed-size buffer. The pointer and
+ * remaining byte count are updated together so commit serialization can build
+ * one contiguous payload without repeated strlen() scans.
+ */
 static int appendf(char **p, size_t *remaining, const char *fmt, ...) {
     va_list ap;
     int n;
@@ -76,6 +99,11 @@ static int appendf(char **p, size_t *remaining, const char *fmt, ...) {
     return 0;
 }
 
+/*
+ * Serializes a root tree, optional parent, batch metadata, and message into the
+ * commit object payload. The helper is shared by normal commits and bootstrap
+ * commits so the only behavioral difference is whether empty event lists are allowed.
+ */
 static scribe_error_t commit_serialize_ex(const uint8_t root_tree[SCRIBE_HASH_SIZE], const uint8_t *parent,
                                           const scribe_change_batch *batch, scribe_arena *arena, uint8_t **out,
                                           size_t *out_len, int allow_empty) {
@@ -91,10 +119,8 @@ static scribe_error_t commit_serialize_ex(const uint8_t root_tree[SCRIBE_HASH_SI
     }
     /*
      * Commit payloads intentionally stay human-readable. Header lines are
-     * separated from the message by a
-     * blank line. The message is copied as raw
-     * bytes after that blank line and may contain arbitrary content;
-     * parsers do
+     * separated from the message by a blank line. The message is copied as raw
+     * bytes after that blank line and may contain arbitrary content; parsers do
      * not attempt to interpret it.
      */
     cap = 512u + batch->message_len + strlen(batch->author.name) + strlen(batch->author.email) +
@@ -137,18 +163,30 @@ static scribe_error_t commit_serialize_ex(const uint8_t root_tree[SCRIBE_HASH_SI
     return SCRIBE_OK;
 }
 
+/*
+ * Serializes a normal commit payload. Normal commits must have at least one
+ * change event because they represent a concrete change batch.
+ */
 scribe_error_t scribe_commit_serialize(const uint8_t root_tree[SCRIBE_HASH_SIZE], const uint8_t *parent,
                                        const scribe_change_batch *batch, scribe_arena *arena, uint8_t **out,
                                        size_t *out_len) {
     return commit_serialize_ex(root_tree, parent, batch, arena, out, out_len, 0);
 }
 
+/*
+ * Serializes a commit payload while permitting an empty event list. Bootstrap
+ * uses this form because its root tree is already the complete baseline snapshot.
+ */
 scribe_error_t scribe_commit_serialize_allow_empty(const uint8_t root_tree[SCRIBE_HASH_SIZE], const uint8_t *parent,
                                                    const scribe_change_batch *batch, scribe_arena *arena, uint8_t **out,
                                                    size_t *out_len) {
     return commit_serialize_ex(root_tree, parent, batch, arena, out, out_len, 1);
 }
 
+/*
+ * Returns the next newline-terminated line from a mutable buffer and replaces
+ * the newline with NUL. The cursor advances past the newline for the next call.
+ */
 static char *next_line(char **cursor, char *end) {
     char *start;
     char *nl;
@@ -166,6 +204,10 @@ static char *next_line(char **cursor, char *end) {
     return start;
 }
 
+/*
+ * Splits one mutable line into at most max_parts tab-separated fields. Tabs are
+ * replaced with NUL bytes so the returned pointers are ordinary C strings.
+ */
 static size_t split_tabs(char *line, char **parts, size_t max_parts) {
     size_t count = 0;
     char *p = line;
@@ -183,6 +225,10 @@ static size_t split_tabs(char *line, char **parts, size_t max_parts) {
     return count;
 }
 
+/*
+ * Parses a commit payload into a view whose string fields point into arena
+ * memory. The caller must keep the arena alive while using the returned view.
+ */
 scribe_error_t scribe_commit_parse(const uint8_t *payload, size_t len, scribe_arena *arena, scribe_commit_view *out) {
     char *copy;
     char *cursor;
@@ -196,10 +242,8 @@ scribe_error_t scribe_commit_parse(const uint8_t *payload, size_t len, scribe_ar
     memset(out, 0, sizeof(*out));
     /*
      * Parsing works on an arena-owned mutable copy because split_tabs() and
-     * next_line() replace
-     * separators with NUL bytes. The returned view points
-     * into that arena copy, so callers must keep the arena
-     * alive while using the
+     * next_line() replace separators with NUL bytes. The returned view points
+     * into that arena copy, so callers must keep the arena alive while using the
      * commit fields.
      */
     copy = scribe_arena_strdup_len(arena, (const char *)payload, len);
@@ -256,6 +300,11 @@ scribe_error_t scribe_commit_parse(const uint8_t *payload, size_t len, scribe_ar
 }
 
 /* Commit construction is implemented in blob.c to keep the tree editing helpers private. */
+/*
+ * Public commit entry point for callers with a writable context and a validated
+ * change batch. The actual tree editing implementation lives in blob.c so its
+ * private mutable-tree helpers do not need to be exposed.
+ */
 scribe_error_t scribe_commit_batch(scribe_ctx *ctx, const scribe_change_batch *batch,
                                    uint8_t out_commit_hash[SCRIBE_HASH_SIZE]) {
     return scribe_commit_batch_internal(ctx, batch, out_commit_hash);

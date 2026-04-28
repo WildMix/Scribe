@@ -1,3 +1,10 @@
+/*
+ * Thread-local error detail storage and error-code naming.
+ *
+ * Most Scribe functions return a compact scribe_error_t value. When they need a
+ * human-readable diagnostic, they store it here in thread-local memory so the
+ * CLI and tests can print the symbolic code plus a precise detail message.
+ */
 #include "util/error.h"
 
 #include <stdarg.h>
@@ -6,10 +13,23 @@
 
 static _Thread_local char g_error_detail[512];
 
+/*
+ * Returns the last detailed error message recorded on this thread. An empty
+ * string is returned instead of NULL so callers can always print the result.
+ */
 const char *scribe_last_error_detail(void) { return g_error_detail[0] == '\0' ? "" : g_error_detail; }
 
+/*
+ * Clears the current thread's detailed error message. Tests and command loops
+ * use this to avoid reporting stale detail after a later operation succeeds.
+ */
 void scribe_clear_error(void) { g_error_detail[0] = '\0'; }
 
+/*
+ * Records a formatted diagnostic for the current thread and returns the error
+ * code passed in. Returning the code makes call sites concise:
+ * `return scribe_set_error(SCRIBE_EINVAL, "...")`.
+ */
 scribe_error_t scribe_set_error(scribe_error_t err, const char *fmt, ...) {
     va_list ap;
 
@@ -23,6 +43,10 @@ scribe_error_t scribe_set_error(scribe_error_t err, const char *fmt, ...) {
     return err;
 }
 
+/*
+ * Converts an error enum into the stable public symbol printed by CLI protocol
+ * responses and diagnostics. Unknown enum values still return a safe fallback.
+ */
 const char *scribe_error_symbol(scribe_error_t err) {
     switch (err) {
     case SCRIBE_OK:

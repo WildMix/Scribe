@@ -1,3 +1,11 @@
+/*
+ * Repository integrity checker.
+ *
+ * The fsck command verifies the reachable object graph starting from
+ * refs/heads/main, then scans loose objects to report valid but unreachable
+ * objects as dangling. Dangling objects are warnings in v1 because interrupted
+ * writes can leave them behind before a ref update publishes a commit.
+ */
 #include "core/internal.h"
 
 #include "util/error.h"
@@ -24,6 +32,11 @@ typedef struct {
  *      subtrees or blobs;
  *   2. identify dangling loose objects during the later full object scan.
  */
+/*
+ * Returns whether the visited set already contains a hash. The set is linear
+ * because fsck is an operator diagnostic path and typical v1 stores are small
+ * enough that clarity is more important than a hash table here.
+ */
 static int visited_has(fsck_state *st, const uint8_t hash[SCRIBE_HASH_SIZE]) {
     size_t i;
 
@@ -35,6 +48,10 @@ static int visited_has(fsck_state *st, const uint8_t hash[SCRIBE_HASH_SIZE]) {
     return 0;
 }
 
+/*
+ * Adds a hash to the visited set unless it is already present. The already flag
+ * lets graph walking avoid recursing through shared subtrees more than once.
+ */
 static scribe_error_t visited_add(fsck_state *st, const uint8_t hash[SCRIBE_HASH_SIZE], int *already) {
     uint8_t *grown;
 
@@ -58,6 +75,11 @@ static scribe_error_t visited_add(fsck_state *st, const uint8_t hash[SCRIBE_HASH
 
 static scribe_error_t fsck_walk_object(fsck_state *st, const uint8_t hash[SCRIBE_HASH_SIZE], uint8_t expected_type);
 
+/*
+ * Walks every child entry referenced by a tree object. Tree parsing verifies the
+ * tree payload itself; this function adds the graph traversal from each entry's
+ * recorded type and hash.
+ */
 static scribe_error_t fsck_walk_tree(fsck_state *st, scribe_object *obj) {
     scribe_arena arena;
     scribe_tree_entry *entries = NULL;
@@ -94,6 +116,11 @@ static scribe_error_t fsck_walk_tree(fsck_state *st, scribe_object *obj) {
     return SCRIBE_OK;
 }
 
+/*
+ * Walks the two graph edges owned by a commit: its root tree and optional
+ * parent commit. Following parents is what makes reachability include history,
+ * not only the newest snapshot.
+ */
 static scribe_error_t fsck_walk_commit(fsck_state *st, scribe_object *obj) {
     scribe_arena arena;
     scribe_commit_view view;
@@ -122,6 +149,10 @@ static scribe_error_t fsck_walk_commit(fsck_state *st, scribe_object *obj) {
     return err;
 }
 
+/*
+ * Verifies and walks one object by hash. The expected_type comes from the parent
+ * ref or tree entry, so a readable object with the wrong type is still corrupt.
+ */
 static scribe_error_t fsck_walk_object(fsck_state *st, const uint8_t hash[SCRIBE_HASH_SIZE], uint8_t expected_type) {
     scribe_object obj;
     int already = 0;
@@ -157,6 +188,11 @@ typedef struct {
     char dir_hex[3];
 } dangling_dir_ctx;
 
+/*
+ * Visits one loose object file during the dangling-object scan. Files whose
+ * names are not valid loose-object suffixes are ignored; valid object-shaped
+ * names not reached earlier are reported as dangling.
+ */
 static scribe_error_t visit_object_file(const char *name, void *vctx) {
     dangling_dir_ctx *dctx = (dangling_dir_ctx *)vctx;
     char hex[SCRIBE_HEX_HASH_SIZE + 1];
@@ -184,6 +220,11 @@ static scribe_error_t visit_object_file(const char *name, void *vctx) {
     return SCRIBE_OK;
 }
 
+/*
+ * Visits one two-character fanout directory under objects/ and delegates each
+ * file to visit_object_file(). Missing directories are tolerated so sparse
+ * object stores do not fail fsck.
+ */
 static scribe_error_t visit_object_dir(const char *name, void *vctx) {
     fsck_state *st = (fsck_state *)vctx;
     char *objects;
@@ -212,6 +253,11 @@ static scribe_error_t visit_object_dir(const char *name, void *vctx) {
     return err == SCRIBE_ENOT_FOUND ? SCRIBE_OK : err;
 }
 
+/*
+ * Implements `scribe fsck`: build the reachable set from main history, scan the
+ * loose object store for unvisited hashes, print dangling warnings, and finish
+ * with a summary count.
+ */
 scribe_error_t scribe_cli_fsck(scribe_ctx *ctx) {
     fsck_state st;
     uint8_t head[SCRIBE_HASH_SIZE];

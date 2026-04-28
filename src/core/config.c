@@ -1,3 +1,11 @@
+/*
+ * Repository configuration parser and writer.
+ *
+ * Scribe v1 uses a small line-oriented `.scribe/config` file. This module
+ * writes the canonical default file during init and parses it strictly on open:
+ * all required keys must be present, values must be supported, and unknown keys
+ * are errors so operator typos are caught immediately.
+ */
 #include "core/internal.h"
 
 #include "util/error.h"
@@ -7,6 +15,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Fills a config struct with the v1 defaults used by new repositories. Defaults
+ * also provide known values while parsing before the required-key mask has been
+ * checked.
+ */
 scribe_error_t scribe_default_config(scribe_config *cfg) {
     if (cfg == NULL) {
         return scribe_set_error(SCRIBE_EINVAL, "config is NULL");
@@ -22,6 +35,11 @@ scribe_error_t scribe_default_config(scribe_config *cfg) {
     return SCRIBE_OK;
 }
 
+/*
+ * Serializes the config struct to `.scribe/config` in the canonical v1 text
+ * format. The file is replaced atomically so commands never observe a partially
+ * written configuration.
+ */
 scribe_error_t scribe_write_config(const char *repo_path, const scribe_config *cfg) {
     char *path;
     char buf[512];
@@ -57,6 +75,11 @@ scribe_error_t scribe_write_config(const char *repo_path, const scribe_config *c
     return err;
 }
 
+/*
+ * Trims leading and trailing ASCII whitespace in place and returns the first
+ * non-space character. Config parsing mutates its read buffer, so this avoids
+ * extra allocations for every key/value pair.
+ */
 static char *trim(char *s) {
     char *end;
 
@@ -70,6 +93,10 @@ static char *trim(char *s) {
     return s;
 }
 
+/*
+ * Parses a non-negative int from a config value. The range check keeps values
+ * portable across platforms where `int` width is the value stored in scribe_config.
+ */
 static scribe_error_t parse_int(const char *s, int *out) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
@@ -80,6 +107,10 @@ static scribe_error_t parse_int(const char *s, int *out) {
     return SCRIBE_OK;
 }
 
+/*
+ * Parses a size_t from a config value. This is used for capacities where the
+ * type should match allocation and queue-size APIs.
+ */
 static scribe_error_t parse_size(const char *s, size_t *out) {
     char *end = NULL;
     unsigned long v = strtoul(s, &end, 10);
@@ -90,6 +121,11 @@ static scribe_error_t parse_size(const char *s, size_t *out) {
     return SCRIBE_OK;
 }
 
+/*
+ * Reads and validates `.scribe/config`. It starts from defaults for a fully
+ * initialized struct, then requires every v1 key to appear so truncated or
+ * manually edited configs do not quietly fall back to defaults.
+ */
 scribe_error_t scribe_read_config(const char *repo_path, scribe_config *cfg) {
     char *path;
     uint8_t *bytes = NULL;

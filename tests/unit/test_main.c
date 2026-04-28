@@ -1,7 +1,22 @@
+/*
+ * Unity test runner for Scribe unit tests.
+ *
+ * Individual test functions live in focused test files. This runner registers
+ * them with Unity and conditionally includes Mongo canonicalization tests when
+ * the Mongo adapter is compiled.
+ */
 #include "unity.h"
 
+/*
+ * Unity setup hook. The current tests create their own repositories/resources,
+ * so no shared per-test setup is needed.
+ */
 void setUp(void) {}
 
+/*
+ * Unity teardown hook. Individual tests clean up their own allocations, so this
+ * remains intentionally empty.
+ */
 void tearDown(void) {}
 
 void test_leb128_round_trip(void);
@@ -18,6 +33,10 @@ void test_mongo_canonical_json_sorts_keys(void);
 void test_mongo_canonical_bson_and_id(void);
 #endif
 
+/*
+ * Runs all compiled Unity tests and returns Unity's aggregate status code to
+ * CTest.
+ */
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_leb128_round_trip);

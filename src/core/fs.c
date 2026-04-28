@@ -1,3 +1,12 @@
+/*
+ * Filesystem helpers for the Scribe repository layout.
+ *
+ * Higher-level code uses this module for path construction, recursive
+ * directory creation, atomic file replacement, full-file reads, existence
+ * checks, and directory iteration. Durability-sensitive writes fsync both the
+ * temporary file and the parent directory so refs and objects survive crashes as
+ * predictably as the host filesystem allows.
+ */
 #include "core/internal.h"
 
 #include "util/error.h"
@@ -12,6 +21,11 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+/*
+ * Joins two path components with exactly one slash between them unless the
+ * first component already ends with slash. The returned string is heap-owned and
+ * must be freed by the caller.
+ */
 char *scribe_path_join(const char *a, const char *b) {
     size_t alen;
     size_t blen;
@@ -39,6 +53,10 @@ char *scribe_path_join(const char *a, const char *b) {
     return out;
 }
 
+/*
+ * Opens and fsyncs the directory containing path. After an atomic rename, this
+ * makes the directory entry update durable instead of only the file contents.
+ */
 static scribe_error_t fsync_parent_dir(const char *path) {
     char *copy;
     char *slash;
@@ -69,6 +87,11 @@ static scribe_error_t fsync_parent_dir(const char *path) {
     return SCRIBE_OK;
 }
 
+/*
+ * Creates a directory and all missing parent directories, like `mkdir -p`.
+ * Existing directories are accepted; other mkdir failures are reported with the
+ * path that failed.
+ */
 scribe_error_t scribe_mkdir_p(const char *path) {
     char *copy;
     char *p;
@@ -100,6 +123,12 @@ scribe_error_t scribe_mkdir_p(const char *path) {
     return SCRIBE_OK;
 }
 
+/*
+ * Writes bytes to a pid-suffixed temporary file, fsyncs it, renames it over the
+ * destination, then fsyncs the parent directory. This is used for refs, config,
+ * logs, adapter state, and loose objects whenever Scribe needs all-or-nothing
+ * file replacement.
+ */
 scribe_error_t scribe_write_file_atomic(const char *path, const uint8_t *bytes, size_t len) {
     char tmp[PATH_MAX];
     int fd;
@@ -140,6 +169,11 @@ scribe_error_t scribe_write_file_atomic(const char *path, const uint8_t *bytes, 
     return fsync_parent_dir(path);
 }
 
+/*
+ * Reads an entire file into a NUL-terminated heap buffer. The extra NUL is for
+ * convenience when callers parse text files, while out_len still reports the
+ * exact number of bytes that came from disk.
+ */
 scribe_error_t scribe_read_file(const char *path, uint8_t **out, size_t *out_len) {
     struct stat st;
     FILE *f;
@@ -178,11 +212,19 @@ scribe_error_t scribe_read_file(const char *path, uint8_t **out, size_t *out_len
     return SCRIBE_OK;
 }
 
+/*
+ * Returns whether a filesystem path currently exists. It is intentionally a
+ * small stat wrapper because callers only need presence, not file type.
+ */
 bool scribe_file_exists(const char *path) {
     struct stat st;
     return path != NULL && stat(path, &st) == 0;
 }
 
+/*
+ * Iterates one directory level and calls visit for each entry except "." and
+ * "..". The visitor controls early failure by returning a non-OK Scribe error.
+ */
 scribe_error_t scribe_list_dir(const char *path, scribe_error_t (*visit)(const char *name, void *ctx), void *ctx) {
     DIR *dir;
     struct dirent *ent;

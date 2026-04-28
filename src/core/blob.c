@@ -1,3 +1,11 @@
+/*
+ * Commit tree editing and publication.
+ *
+ * Despite the filename, this module owns the mutable tree builder used by
+ * scribe_commit_batch(). It loads the current root tree, applies blob writes and
+ * tombstones, writes new tree objects bottom-up, writes the commit object, and
+ * finally advances refs/heads/main with compare-and-swap publication.
+ */
 #include "core/internal.h"
 
 #include "util/error.h"
@@ -23,6 +31,10 @@ struct tree_node {
     size_t cap;
 };
 
+/*
+ * Allocates an empty mutable tree node from the work arena. All nodes created
+ * during one commit are freed together when that arena is destroyed.
+ */
 static tree_node *node_new(scribe_arena *arena) {
     tree_node *node = (tree_node *)scribe_arena_alloc(arena, sizeof(*node), _Alignof(tree_node));
     if (node != NULL) {
@@ -31,6 +43,10 @@ static tree_node *node_new(scribe_arena *arena) {
     return node;
 }
 
+/*
+ * Finds an entry by exact C-string name in a mutable tree node. The return value
+ * is the entry index or -1 when the name is absent.
+ */
 static ssize_t node_find(tree_node *node, const char *name) {
     size_t i;
 
@@ -42,6 +58,11 @@ static ssize_t node_find(tree_node *node, const char *name) {
     return -1;
 }
 
+/*
+ * Ensures a mutable tree node has room for one more entry. Because arena memory
+ * cannot be reallocated in place, growth copies the old entry array into a new
+ * arena allocation.
+ */
 static scribe_error_t node_reserve(scribe_arena *arena, tree_node *node) {
     node_entry *grown;
     size_t new_cap;
@@ -68,6 +89,11 @@ static scribe_error_t node_reserve(scribe_arena *arena, tree_node *node) {
     return SCRIBE_OK;
 }
 
+/*
+ * Sets or replaces a child tree entry in a mutable node. Replacing a previous
+ * blob with a tree is allowed only after higher-level path validation has
+ * decided that the batch semantics require a tree at that name.
+ */
 static scribe_error_t node_set_tree(scribe_arena *arena, tree_node *node, const char *name, tree_node *child) {
     ssize_t idx = node_find(node, name);
 
@@ -92,6 +118,11 @@ static scribe_error_t node_set_tree(scribe_arena *arena, tree_node *node, const 
     return SCRIBE_OK;
 }
 
+/*
+ * Sets or replaces a blob entry in a mutable node with an already-written blob
+ * hash. The entry keeps only the hash because blobs themselves are immutable
+ * object-store contents.
+ */
 static scribe_error_t node_set_blob(scribe_arena *arena, tree_node *node, const char *name,
                                     const uint8_t hash[SCRIBE_HASH_SIZE]) {
     ssize_t idx = node_find(node, name);
@@ -117,6 +148,10 @@ static scribe_error_t node_set_blob(scribe_arena *arena, tree_node *node, const 
     return SCRIBE_OK;
 }
 
+/*
+ * Removes an entry by name from a mutable node. Missing entries are a no-op so
+ * deleting an already-absent document path remains idempotent.
+ */
 static void node_delete(tree_node *node, const char *name) {
     ssize_t idx = node_find(node, name);
 
@@ -130,6 +165,10 @@ static void node_delete(tree_node *node, const char *name) {
     node->count--;
 }
 
+/*
+ * Adds a size contribution while checking for size_t overflow. Arena-capacity
+ * estimation uses this so large trees fail as SCRIBE_ENOMEM instead of wrapping.
+ */
 static scribe_error_t checked_add_size(size_t *total, size_t add) {
     if (*total > SIZE_MAX - add) {
         return scribe_set_error(SCRIBE_ENOMEM, "tree arena size is too large");
@@ -138,6 +177,11 @@ static scribe_error_t checked_add_size(size_t *total, size_t add) {
     return SCRIBE_OK;
 }
 
+/*
+ * Estimates the temporary arena size needed to serialize one mutable tree node.
+ * It accounts for the tree-entry array, sorted copy, encoded names, and a small
+ * fixed overhead used by the tree serializer.
+ */
 static scribe_error_t tree_write_arena_capacity(const tree_node *node, size_t *out) {
     size_t i;
     size_t entry_count;
@@ -164,6 +208,11 @@ static scribe_error_t tree_write_arena_capacity(const tree_node *node, size_t *o
     return SCRIBE_OK;
 }
 
+/*
+ * Loads an immutable tree object into mutable arena-owned tree_node structures.
+ * This gives the commit builder an editable view of the current root tree before
+ * applying the new batch.
+ */
 static scribe_error_t load_tree(scribe_ctx *ctx, scribe_arena *work, const uint8_t hash[SCRIBE_HASH_SIZE],
                                 tree_node **out) {
     scribe_object obj;
@@ -234,6 +283,11 @@ static scribe_error_t load_tree(scribe_ctx *ctx, scribe_arena *work, const uint8
     return SCRIBE_OK;
 }
 
+/*
+ * Recursively estimates additional work-arena capacity needed to load an
+ * existing persistent tree. This prevents large repositories from exhausting the
+ * fixed commit arena during updates.
+ */
 static scribe_error_t estimate_tree_work_capacity(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE],
                                                   size_t *capacity) {
     scribe_object obj;
@@ -288,6 +342,11 @@ static scribe_error_t estimate_tree_work_capacity(scribe_ctx *ctx, const uint8_t
     return SCRIBE_OK;
 }
 
+/*
+ * Applies one change event to the mutable tree. Non-NULL payloads are written as
+ * blob objects and installed at the leaf path; NULL payloads delete the leaf as
+ * a tombstone.
+ */
 static scribe_error_t apply_change(scribe_ctx *ctx, scribe_arena *work, tree_node *root,
                                    const scribe_change_event *ev) {
     tree_node *node = root;
@@ -332,6 +391,10 @@ static scribe_error_t apply_change(scribe_ctx *ctx, scribe_arena *work, tree_nod
     }
 }
 
+/*
+ * Serializes a mutable tree and all of its child trees into immutable tree
+ * objects. Children are written first because parent entries need child hashes.
+ */
 static scribe_error_t write_tree_recursive(scribe_ctx *ctx, tree_node *node, uint8_t out_hash[SCRIBE_HASH_SIZE]) {
     scribe_tree_entry *entries;
     scribe_arena arena;
@@ -386,6 +449,11 @@ static scribe_error_t write_tree_recursive(scribe_ctx *ctx, tree_node *node, uin
     return err;
 }
 
+/*
+ * Reads refs/heads/main and extracts the root tree hash from the current commit.
+ * If the repository has no main ref yet, has_parent is false and the caller
+ * should start from a new empty root tree.
+ */
 static scribe_error_t read_head_root_hash(scribe_ctx *ctx, uint8_t parent_hash[SCRIBE_HASH_SIZE], int *has_parent,
                                           uint8_t root_hash[SCRIBE_HASH_SIZE]) {
     scribe_error_t err;
@@ -432,6 +500,11 @@ static scribe_error_t read_head_root_hash(scribe_ctx *ctx, uint8_t parent_hash[S
     }
 }
 
+/*
+ * Builds a normal commit from a change batch. The function applies changes to
+ * the current tree, writes all required objects, and publishes the new commit as
+ * refs/heads/main only after every object write succeeds.
+ */
 scribe_error_t scribe_commit_batch_internal(scribe_ctx *ctx, const scribe_change_batch *batch,
                                             uint8_t out_commit_hash[SCRIBE_HASH_SIZE]) {
     tree_node *root = NULL;
@@ -526,6 +599,11 @@ scribe_error_t scribe_commit_batch_internal(scribe_ctx *ctx, const scribe_change
     return SCRIBE_OK;
 }
 
+/*
+ * Wraps an already-written root tree in a commit and publishes it. Mongo
+ * bootstrap uses this path because it builds a complete snapshot tree directly
+ * instead of replaying individual change events through apply_change().
+ */
 scribe_error_t scribe_commit_root_internal(scribe_ctx *ctx, const uint8_t root_tree[SCRIBE_HASH_SIZE],
                                            const scribe_change_batch *metadata,
                                            uint8_t out_commit_hash[SCRIBE_HASH_SIZE]) {

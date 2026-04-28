@@ -1,3 +1,11 @@
+/*
+ * MongoDB adapter bootstrap and steady-state watch implementation.
+ *
+ * This file connects MongoDB change streams to Scribe commits. It bootstraps a
+ * deterministic snapshot tree, persists Mongo resume state only after Scribe
+ * commits land, consumes change stream events, groups transaction events into
+ * one commit, and restarts bootstrap when Mongo invalidates the stream.
+ */
 #include "adapter_mongo/mongo_adapter.h"
 
 #include "adapter_mongo/mongo_internal.h"
@@ -66,6 +74,10 @@ typedef struct {
     scribe_error_t err;
 } mongo_worker_ctx;
 
+/*
+ * Releases heap memory inside a watch scope. The scope currently contains only
+ * the optional database name parsed from the URI.
+ */
 static void mongo_watch_scope_destroy(mongo_watch_scope *scope) {
     if (scope != NULL) {
         free(scope->database);
@@ -73,6 +85,11 @@ static void mongo_watch_scope_destroy(mongo_watch_scope *scope) {
     }
 }
 
+/*
+ * Parses a MongoDB URI and records whether the watch should be database-scoped.
+ * A URI with a path component watches that database; a URI without one attempts
+ * a cluster-scoped watch.
+ */
 static scribe_error_t mongo_watch_scope_from_uri(const char *uri, mongo_watch_scope *scope) {
     mongoc_uri_t *parsed;
     bson_error_t error;
@@ -98,6 +115,10 @@ static scribe_error_t mongo_watch_scope_from_uri(const char *uri, mongo_watch_sc
     return SCRIBE_OK;
 }
 
+/*
+ * Encodes raw BSON resume-token bytes into base64 for the line-oriented
+ * adapter-state file. The returned string is heap-owned.
+ */
 static char *base64_encode(const uint8_t *data, size_t len) {
     static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t out_len = ((len + 2u) / 3u) * 4u;
@@ -130,6 +151,10 @@ static char *base64_encode(const uint8_t *data, size_t len) {
     return out;
 }
 
+/*
+ * Converts one base64 character into its six-bit value. Invalid characters
+ * return -1 so the decoder can reject malformed adapter-state tokens.
+ */
 static int base64_value(char c) {
     if (c >= 'A' && c <= 'Z') {
         return c - 'A';
@@ -149,6 +174,10 @@ static int base64_value(char c) {
     return -1;
 }
 
+/*
+ * Decodes a base64 resume token back into raw BSON bytes. The output buffer is
+ * heap-owned and later passed to bson_init_static().
+ */
 static scribe_error_t base64_decode(const char *s, uint8_t **out, size_t *out_len) {
     size_t len;
     size_t pad = 0;
@@ -207,6 +236,10 @@ static scribe_error_t base64_decode(const char *s, uint8_t **out, size_t *out_le
     return SCRIBE_OK;
 }
 
+/*
+ * Initializes the bounded bootstrap task queue. The queue coordinates one
+ * MongoDB enumeration thread with several BSON canonicalization workers.
+ */
 static scribe_error_t task_queue_init(mongo_task_queue *q, size_t capacity) {
     memset(q, 0, sizeof(*q));
     q->capacity = capacity == 0 ? 64u : capacity;
@@ -225,12 +258,20 @@ static scribe_error_t task_queue_init(mongo_task_queue *q, size_t capacity) {
  * results to a mutex-protected vector. The bounded queue prevents a very large
  * collection from being copied entirely into memory before workers catch up.
  */
+/*
+ * Destroys synchronization primitives owned by the bootstrap task queue. Tasks
+ * must already have been drained or freed by the caller.
+ */
 static void task_queue_destroy(mongo_task_queue *q) {
     pthread_cond_destroy(&q->not_full);
     pthread_cond_destroy(&q->not_empty);
     pthread_mutex_destroy(&q->mu);
 }
 
+/*
+ * Pushes one document task into the bounded queue, blocking while the queue is
+ * full so bootstrap memory use cannot grow without limit.
+ */
 static scribe_error_t task_queue_push(mongo_task_queue *q, mongo_task *task) {
     pthread_mutex_lock(&q->mu);
     while (q->count == q->capacity) {
@@ -250,6 +291,10 @@ static scribe_error_t task_queue_push(mongo_task_queue *q, mongo_task *task) {
     return SCRIBE_OK;
 }
 
+/*
+ * Pops one document task for a worker. NULL means the queue is both closed and
+ * empty, which tells workers to exit.
+ */
 static mongo_task *task_queue_pop(mongo_task_queue *q) {
     mongo_task *task;
 
@@ -270,6 +315,10 @@ static mongo_task *task_queue_pop(mongo_task_queue *q) {
     return task;
 }
 
+/*
+ * Marks the task queue closed and wakes all workers waiting for more work. This
+ * is called after MongoDB enumeration finishes or aborts.
+ */
 static void task_queue_close(mongo_task_queue *q) {
     pthread_mutex_lock(&q->mu);
     q->closed = 1;
@@ -277,6 +326,10 @@ static void task_queue_close(mongo_task_queue *q) {
     pthread_mutex_unlock(&q->mu);
 }
 
+/*
+ * Frees a queued MongoDB document task, including the copied BSON document and
+ * duplicated namespace strings.
+ */
 static void free_task(mongo_task *task) {
     if (task != NULL) {
         bson_destroy(task->doc);
@@ -286,6 +339,10 @@ static void free_task(mongo_task *task) {
     }
 }
 
+/*
+ * Initializes the thread-safe bootstrap result list. Workers append canonicalized
+ * document results here after processing queue tasks.
+ */
 static scribe_error_t results_init(mongo_results *results) {
     memset(results, 0, sizeof(*results));
     if (pthread_mutex_init(&results->mu, NULL) != 0) {
@@ -294,6 +351,9 @@ static scribe_error_t results_init(mongo_results *results) {
     return SCRIBE_OK;
 }
 
+/*
+ * Frees one canonicalized MongoDB result and its path/payload allocations.
+ */
 static void result_free(mongo_result *r) {
     if (r != NULL) {
         if (r->path != NULL) {
@@ -306,6 +366,10 @@ static void result_free(mongo_result *r) {
     }
 }
 
+/*
+ * Frees every result and destroys the result-list mutex. This is used after
+ * bootstrap commit creation or after a bootstrap failure.
+ */
 static void results_destroy(mongo_results *results) {
     size_t i;
     for (i = 0; i < results->count; i++) {
@@ -315,6 +379,10 @@ static void results_destroy(mongo_results *results) {
     pthread_mutex_destroy(&results->mu);
 }
 
+/*
+ * Appends one worker result to the shared result list. The result ownership
+ * moves into the list on success.
+ */
 static scribe_error_t results_add(mongo_results *results, mongo_result *result) {
     mongo_result *grown;
 
@@ -349,10 +417,18 @@ struct mongo_snapshot_node {
     size_t cap;
 };
 
+/*
+ * Allocates an empty in-memory snapshot node. Bootstrap uses these nodes to
+ * assemble database/collection/document-id trees before writing Scribe objects.
+ */
 static mongo_snapshot_node *snapshot_node_new(void) {
     return (mongo_snapshot_node *)calloc(1, sizeof(mongo_snapshot_node));
 }
 
+/*
+ * Recursively frees an in-memory snapshot tree. Child pointers are valid only
+ * for tree entries; blob entries have no child to free.
+ */
 static void snapshot_node_free(mongo_snapshot_node *node) {
     size_t i;
 
@@ -367,6 +443,9 @@ static void snapshot_node_free(mongo_snapshot_node *node) {
     free(node);
 }
 
+/*
+ * Finds a snapshot entry by exact name and returns its index, or -1 when absent.
+ */
 static ssize_t snapshot_node_find(mongo_snapshot_node *node, const char *name) {
     size_t i;
 
@@ -378,6 +457,10 @@ static ssize_t snapshot_node_find(mongo_snapshot_node *node, const char *name) {
     return -1;
 }
 
+/*
+ * Ensures a snapshot node can accept another entry. The snapshot tree uses heap
+ * arrays because it survives beyond any one arena parse operation.
+ */
 static scribe_error_t snapshot_node_reserve(mongo_snapshot_node *node) {
     mongo_snapshot_entry *grown;
     size_t new_cap;
@@ -396,6 +479,10 @@ static scribe_error_t snapshot_node_reserve(mongo_snapshot_node *node) {
     return SCRIBE_OK;
 }
 
+/*
+ * Finds or creates a child tree node under a snapshot node. It fails if an
+ * existing blob already occupies the requested tree position.
+ */
 static scribe_error_t snapshot_node_child(mongo_snapshot_node *node, const char *name, mongo_snapshot_node **out) {
     ssize_t idx = snapshot_node_find(node, name);
     mongo_snapshot_node *child;
@@ -426,6 +513,10 @@ static scribe_error_t snapshot_node_child(mongo_snapshot_node *node, const char 
     return SCRIBE_OK;
 }
 
+/*
+ * Sets or replaces one blob entry in the in-memory snapshot tree. Replacing a
+ * previous tree frees that subtree because the leaf is now a document blob.
+ */
 static scribe_error_t snapshot_node_set_blob(mongo_snapshot_node *node, const char *name,
                                              const uint8_t hash[SCRIBE_HASH_SIZE]) {
     ssize_t idx = snapshot_node_find(node, name);
@@ -451,6 +542,10 @@ static scribe_error_t snapshot_node_set_blob(mongo_snapshot_node *node, const ch
     return SCRIBE_OK;
 }
 
+/*
+ * Writes one canonicalized document result into the snapshot: the payload is
+ * stored as a blob, then its hash is installed at database/collection/id.
+ */
 static scribe_error_t snapshot_add_result(scribe_ctx *ctx, mongo_snapshot_node *root, const mongo_result *result) {
     mongo_snapshot_node *db;
     mongo_snapshot_node *coll;
@@ -472,6 +567,10 @@ static scribe_error_t snapshot_add_result(scribe_ctx *ctx, mongo_snapshot_node *
     return snapshot_node_set_blob(coll, result->path[2], blob_hash);
 }
 
+/*
+ * Adds to a size accumulator with overflow checking. Snapshot tree serialization
+ * uses this before allocating fixed-size arenas.
+ */
 static scribe_error_t checked_add_size(size_t *total, size_t add) {
     if (*total > SIZE_MAX - add) {
         return scribe_set_error(SCRIBE_ENOMEM, "MongoDB snapshot tree arena size is too large");
@@ -480,6 +579,10 @@ static scribe_error_t checked_add_size(size_t *total, size_t add) {
     return SCRIBE_OK;
 }
 
+/*
+ * Estimates the arena capacity needed to serialize one snapshot node as a
+ * Scribe tree object.
+ */
 static scribe_error_t snapshot_tree_arena_capacity(const mongo_snapshot_node *node, size_t *out) {
     size_t i;
     size_t entry_count;
@@ -506,6 +609,10 @@ static scribe_error_t snapshot_tree_arena_capacity(const mongo_snapshot_node *no
     return SCRIBE_OK;
 }
 
+/*
+ * Recursively writes a snapshot node as immutable Scribe tree objects. Child
+ * trees are written first so parent entries can contain their hashes.
+ */
 static scribe_error_t snapshot_write_tree(scribe_ctx *ctx, mongo_snapshot_node *node,
                                           uint8_t out_hash[SCRIBE_HASH_SIZE]) {
     scribe_tree_entry *entries;
@@ -552,6 +659,10 @@ static scribe_error_t snapshot_write_tree(scribe_ctx *ctx, mongo_snapshot_node *
     return err;
 }
 
+/*
+ * Hashes canonical document payload bytes for deterministic debugging and result
+ * ordering checks. Object storage computes its own envelope hash later.
+ */
 static void hash_payload(const uint8_t *payload, size_t payload_len, uint8_t out[SCRIBE_HASH_SIZE]) {
     blake3_hasher hasher;
     blake3_hasher_init(&hasher);
@@ -559,6 +670,10 @@ static void hash_payload(const uint8_t *payload, size_t payload_len, uint8_t out
     blake3_hasher_finalize(&hasher, out, SCRIBE_HASH_SIZE);
 }
 
+/*
+ * Converts one queued MongoDB document into a Scribe path and canonical payload.
+ * Workers call this after receiving a copied BSON document from the queue.
+ */
 static scribe_error_t process_task(mongo_task *task, mongo_result *out) {
     char *id = NULL;
     uint8_t *payload = NULL;
@@ -607,6 +722,10 @@ static scribe_error_t process_task(mongo_task *task, mongo_result *out) {
     return SCRIBE_OK;
 }
 
+/*
+ * Worker thread entry point for bootstrap canonicalization. It drains the task
+ * queue, records its first error, and appends successful results to the shared list.
+ */
 static void *worker_main(void *arg) {
     mongo_worker_ctx *ctx = (mongo_worker_ctx *)arg;
 
@@ -637,6 +756,10 @@ static void *worker_main(void *arg) {
     return NULL;
 }
 
+/*
+ * Returns whether a database should be skipped during cluster-scoped bootstrap.
+ * The excluded list comes from `.scribe/config` as comma-separated names.
+ */
 static int is_excluded_db(scribe_ctx *ctx, const char *db) {
     char excluded[sizeof(ctx->config.adapter_excluded_databases)];
     char *save = NULL;
@@ -651,6 +774,10 @@ static int is_excluded_db(scribe_ctx *ctx, const char *db) {
     return 0;
 }
 
+/*
+ * Runs a MongoDB hello command and verifies the deployment supports change
+ * streams, meaning replica set or sharded-cluster topology.
+ */
 static scribe_error_t verify_topology(mongoc_client_t *client) {
     bson_t cmd;
     bson_t reply;
@@ -677,6 +804,10 @@ static scribe_error_t verify_topology(mongoc_client_t *client) {
     return SCRIBE_OK;
 }
 
+/*
+ * Retries topology verification while a local test replica set is still
+ * electing. The first retry logs a waiting message for operator visibility.
+ */
 static scribe_error_t verify_topology_with_retry(scribe_ctx *ctx, mongoc_client_t *client) {
     scribe_error_t err = SCRIBE_ERR;
     int attempt;
@@ -694,6 +825,10 @@ static scribe_error_t verify_topology_with_retry(scribe_ctx *ctx, mongoc_client_
     return err;
 }
 
+/*
+ * Opens either a database-scoped or cluster-scoped change stream based on the
+ * parsed watch scope. The caller owns the returned stream.
+ */
 static mongoc_change_stream_t *watch_from_scope(mongoc_client_t *client, const mongo_watch_scope *scope,
                                                 const bson_t *pipeline, const bson_t *opts) {
     if (scope != NULL && scope->database != NULL) {
@@ -709,6 +844,11 @@ static mongoc_change_stream_t *watch_from_scope(mongoc_client_t *client, const m
     return mongoc_client_watch(client, pipeline, opts);
 }
 
+/*
+ * Opens a short-lived change stream before bootstrap scanning and captures its
+ * current resume token. After the snapshot commit lands, steady-state watching
+ * resumes from this token to replay writes that raced with the scan.
+ */
 static scribe_error_t capture_start_resume_token(mongoc_client_t *client, const mongo_watch_scope *scope,
                                                  char **out_token) {
     bson_t pipeline;
@@ -759,6 +899,10 @@ static scribe_error_t capture_start_resume_token(mongoc_client_t *client, const 
     return SCRIBE_OK;
 }
 
+/*
+ * Chooses the bootstrap worker count. An explicit config value wins; otherwise
+ * use the online CPU count with a minimum of one worker.
+ */
 static long worker_count(scribe_ctx *ctx) {
     long n;
 
@@ -772,6 +916,10 @@ static long worker_count(scribe_ctx *ctx) {
     return n;
 }
 
+/*
+ * Enumerates every document in one MongoDB collection and pushes copied BSON
+ * tasks into the bootstrap queue.
+ */
 static scribe_error_t enqueue_collection(mongo_task_queue *queue, mongoc_collection_t *collection, const char *db_name,
                                          const char *coll_name) {
     bson_t query;
@@ -817,6 +965,10 @@ static scribe_error_t enqueue_collection(mongo_task_queue *queue, mongoc_collect
     return SCRIBE_OK;
 }
 
+/*
+ * Lists collections in one database and enqueues all documents from each
+ * collection for bootstrap worker processing.
+ */
 static scribe_error_t enqueue_database_documents(mongoc_client_t *client, mongo_task_queue *queue,
                                                  const char *db_name) {
     bson_error_t error;
@@ -846,6 +998,10 @@ static scribe_error_t enqueue_database_documents(mongoc_client_t *client, mongo_
     return SCRIBE_OK;
 }
 
+/*
+ * Enqueues the bootstrap scan scope. Database-scoped watches scan one database;
+ * cluster-scoped watches list databases and skip configured excluded names.
+ */
 static scribe_error_t enqueue_all_documents(scribe_ctx *ctx, mongoc_client_t *client, const mongo_watch_scope *scope,
                                             mongo_task_queue *queue) {
     bson_error_t error;
@@ -874,12 +1030,19 @@ static scribe_error_t enqueue_all_documents(scribe_ctx *ctx, mongoc_client_t *cl
     return SCRIBE_OK;
 }
 
+/*
+ * Returns the current wall-clock time as Unix nanoseconds for synthetic commit
+ * timestamps such as bootstrap commits.
+ */
 static int64_t unix_nanos_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (int64_t)ts.tv_sec * INT64_C(1000000000) + (int64_t)ts.tv_nsec;
 }
 
+/*
+ * Formats the current UTC time in the ISO-8601 form used by adapter-state.
+ */
 static void iso8601_now(char out[32]) {
     time_t now = time(NULL);
     struct tm tm_utc;
@@ -888,6 +1051,11 @@ static void iso8601_now(char out[32]) {
     }
 }
 
+/*
+ * Writes `.scribe/adapter-state/mongodb` after a successful bootstrap or change
+ * stream commit. The file records the resume token, last commit hash, and
+ * update timestamp in the strict three-line v1 format.
+ */
 static scribe_error_t write_adapter_state(scribe_ctx *ctx, const char *resume_token,
                                           const uint8_t commit_hash[SCRIBE_HASH_SIZE]) {
     char hex[SCRIBE_HEX_HASH_SIZE + 1];
@@ -948,6 +1116,11 @@ static scribe_error_t write_adapter_state(scribe_ctx *ctx, const char *resume_to
     return err;
 }
 
+/*
+ * Reads and validates the MongoDB adapter-state file. The resume token is
+ * returned as a heap string and the last commit hash is decoded for callers that
+ * want to inspect the stored boundary.
+ */
 static scribe_error_t read_adapter_state(scribe_ctx *ctx, char **out_resume_token,
                                          uint8_t out_last_commit[SCRIBE_HASH_SIZE]) {
     char *path;
@@ -1017,6 +1190,11 @@ static scribe_error_t read_adapter_state(scribe_ctx *ctx, char **out_resume_toke
     return SCRIBE_OK;
 }
 
+/*
+ * Rewrites adapter state with the special invalid token while preserving the
+ * current HEAD commit hash. This records that a previous resume token can no
+ * longer be trusted.
+ */
 static scribe_error_t mark_adapter_state_invalid(scribe_ctx *ctx) {
     uint8_t head[SCRIBE_HASH_SIZE];
     scribe_error_t err = scribe_refs_read(ctx, "refs/heads/main", head);
@@ -1027,6 +1205,10 @@ static scribe_error_t mark_adapter_state_invalid(scribe_ctx *ctx) {
     return write_adapter_state(ctx, SCRIBE_MONGO_STATE_INVALID, head);
 }
 
+/*
+ * Converts all bootstrap worker results into one snapshot commit. It first
+ * builds an in-memory tree, writes blobs/trees, then wraps the root in a commit.
+ */
 static scribe_error_t commit_results(scribe_ctx *ctx, mongo_results *results, uint8_t out_commit[SCRIBE_HASH_SIZE]) {
     scribe_change_batch batch;
     mongo_snapshot_node *root;
@@ -1068,6 +1250,10 @@ static scribe_error_t commit_results(scribe_ctx *ctx, mongo_results *results, ui
     return scribe_commit_root_internal(ctx, root_hash, &batch, out_commit);
 }
 
+/*
+ * Runs the full MongoDB bootstrap cycle: capture a starting token, start worker
+ * threads, enumerate documents, write the snapshot commit, and persist state.
+ */
 static scribe_error_t run_bootstrap(scribe_ctx *ctx, mongoc_client_t *client, const mongo_watch_scope *scope) {
     mongo_task_queue queue;
     mongo_results results;
@@ -1148,11 +1334,19 @@ static scribe_error_t run_bootstrap(scribe_ctx *ctx, mongoc_client_t *client, co
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
+/*
+ * Async-signal-safe handler that only flips the global shutdown flag. The main
+ * watch loop observes the flag and performs normal cleanup outside the handler.
+ */
 static void mongo_signal_handler(int signo) {
     (void)signo;
     g_shutdown_requested = 1;
 }
 
+/*
+ * Installs SIGTERM/SIGINT handlers for clean adapter shutdown. On shutdown the
+ * watch loop drains the current batch before releasing the repository lock.
+ */
 static scribe_error_t install_signal_handlers(void) {
     struct sigaction sa;
 
@@ -1180,6 +1374,10 @@ typedef struct {
     int64_t timestamp_unix_nanos;
 } mongo_watch_batch;
 
+/*
+ * Frees one pending change-stream change and clears it. Ownership of path and
+ * payload moves into a batch before this cleanup function is used.
+ */
 static void watch_change_free(mongo_watch_change *change) {
     if (change == NULL) {
         return;
@@ -1194,6 +1392,10 @@ static void watch_change_free(mongo_watch_change *change) {
     memset(change, 0, sizeof(*change));
 }
 
+/*
+ * Frees all pending changes, resume token, and transaction key owned by a watch
+ * batch. It is safe to call for empty batches.
+ */
 static void watch_batch_clear(mongo_watch_batch *batch) {
     size_t i;
 
@@ -1209,6 +1411,10 @@ static void watch_batch_clear(mongo_watch_batch *batch) {
     memset(batch, 0, sizeof(*batch));
 }
 
+/*
+ * Ensures a watch batch has space for one more event. Batches grow only while a
+ * MongoDB transaction is open or while a shutdown/invalidation flush is pending.
+ */
 static scribe_error_t watch_batch_reserve(mongo_watch_batch *batch) {
     mongo_watch_change *grown;
     size_t new_cap;
@@ -1227,6 +1433,10 @@ static scribe_error_t watch_batch_reserve(mongo_watch_batch *batch) {
     return SCRIBE_OK;
 }
 
+/*
+ * Adds a change-stream data event to the current batch and records the newest
+ * resume token represented by that batch.
+ */
 static scribe_error_t watch_batch_add(mongo_watch_batch *batch, mongo_watch_change *change, char **resume_token,
                                       int64_t timestamp_unix_nanos) {
     if (watch_batch_reserve(batch) != SCRIBE_OK) {
@@ -1249,6 +1459,11 @@ static scribe_error_t watch_batch_add(mongo_watch_batch *batch, mongo_watch_chan
     return SCRIBE_OK;
 }
 
+/*
+ * Commits the current watch batch to Scribe and then persists adapter state.
+ * Empty batches are a no-op; nonempty batches transfer their change events into
+ * a normal scribe_change_batch.
+ */
 static scribe_error_t watch_batch_commit(scribe_ctx *ctx, mongo_watch_batch *watch_batch) {
     scribe_change_event *events;
     scribe_change_batch batch;
@@ -1301,16 +1516,28 @@ static scribe_error_t watch_batch_commit(scribe_ctx *ctx, mongo_watch_batch *wat
     return SCRIBE_OK;
 }
 
+/*
+ * Returns whether an adapter-state resume token should be used. Empty and
+ * explicitly invalid tokens force bootstrap instead of stream resume.
+ */
 static int token_is_usable(const char *resume_token) {
     return resume_token != NULL && resume_token[0] != '\0' && strcmp(resume_token, SCRIBE_MONGO_STATE_INVALID) != 0;
 }
 
+/*
+ * Recognizes MongoDB errors that mean a saved resume token can no longer be
+ * used. These errors trigger invalidate recovery rather than a hard adapter stop.
+ */
 static int mongo_resume_error_is_unusable(const char *message) {
     return message != NULL &&
            (strstr(message, "cannot resume stream") != NULL || strstr(message, "resume token was not found") != NULL ||
             strstr(message, "Resume token was not found") != NULL);
 }
 
+/*
+ * Encodes the BSON resume token from a stream/event into adapter-state base64.
+ * Missing tokens are fatal because the adapter cannot safely advance its boundary.
+ */
 static scribe_error_t resume_token_to_base64(const bson_t *token, char **out) {
     if (token == NULL || bson_empty(token)) {
         return scribe_set_error(SCRIBE_EADAPTER, "MongoDB change stream event has no resume token");
@@ -1322,6 +1549,11 @@ static scribe_error_t resume_token_to_base64(const bson_t *token, char **out) {
     return SCRIBE_OK;
 }
 
+/*
+ * Opens a MongoDB change stream with v1 options and optional resumeAfter token.
+ * When Mongo rejects the token as unusable, resume_token_unusable is set so the
+ * caller can restart bootstrap automatically.
+ */
 static scribe_error_t open_change_stream(mongoc_client_t *client, const mongo_watch_scope *scope,
                                          const char *resume_token, mongoc_change_stream_t **out,
                                          int *resume_token_unusable) {
@@ -1389,6 +1621,10 @@ static scribe_error_t open_change_stream(mongoc_client_t *client, const mongo_wa
     return SCRIBE_OK;
 }
 
+/*
+ * Extracts a nested BSON document field from a change-stream event using a
+ * static view into the event's backing buffer.
+ */
 static scribe_error_t event_document(const bson_t *event, const char *field, bson_t *out) {
     bson_iter_t iter;
     const uint8_t *data;
@@ -1405,6 +1641,10 @@ static scribe_error_t event_document(const bson_t *event, const char *field, bso
     return SCRIBE_OK;
 }
 
+/*
+ * Reads the operationType string from a change-stream event. The returned
+ * pointer is owned by the BSON event and remains valid while the event is valid.
+ */
 static scribe_error_t event_operation(const bson_t *event, const char **out) {
     bson_iter_t iter;
     uint32_t len;
@@ -1417,6 +1657,10 @@ static scribe_error_t event_operation(const bson_t *event, const char **out) {
     return SCRIBE_OK;
 }
 
+/*
+ * Classifies MongoDB operationType values into data events Scribe commits,
+ * invalidation events that restart bootstrap, and DDL/schema events that are logged.
+ */
 static mongo_event_kind classify_operation(const char *op) {
     if (strcmp(op, "insert") == 0 || strcmp(op, "update") == 0 || strcmp(op, "replace") == 0 ||
         strcmp(op, "modify") == 0 || strcmp(op, "delete") == 0) {
@@ -1429,6 +1673,10 @@ static mongo_event_kind classify_operation(const char *op) {
     return MONGO_EVENT_IGNORED;
 }
 
+/*
+ * Extracts ns.db and ns.coll from a change-stream event and duplicates them for
+ * use in a Scribe path.
+ */
 static scribe_error_t event_namespace(const bson_t *event, char **out_db, char **out_coll) {
     bson_t ns;
     bson_iter_t iter;
@@ -1461,6 +1709,10 @@ static scribe_error_t event_namespace(const bson_t *event, char **out_db, char *
     return SCRIBE_OK;
 }
 
+/*
+ * Extracts documentKey from a change-stream event and canonicalizes its `_id`
+ * value into the Mongo tree leaf name.
+ */
 static scribe_error_t event_document_id(const bson_t *event, char **out_id) {
     bson_t key;
 
@@ -1470,6 +1722,10 @@ static scribe_error_t event_document_id(const bson_t *event, char **out_id) {
     return scribe_mongo_canonicalize_id(&key, out_id);
 }
 
+/*
+ * Converts a MongoDB data event into a Scribe watch change. Deletes become
+ * tombstones; inserts/updates/replaces/modifies store the full canonical document.
+ */
 static scribe_error_t build_watch_change(const bson_t *event, const char *op, mongo_watch_change *out) {
     char *db = NULL;
     char *coll = NULL;
@@ -1529,6 +1785,10 @@ static scribe_error_t build_watch_change(const bson_t *event, const char *op, mo
     return SCRIBE_OK;
 }
 
+/*
+ * Converts MongoDB clusterTime Timestamp(seconds, increment) into the v1 Unix
+ * nanoseconds field used for commit timestamps.
+ */
 static int64_t event_cluster_time_unix_nanos(const bson_t *event) {
     bson_iter_t iter;
     uint32_t seconds;
@@ -1544,6 +1804,10 @@ static int64_t event_cluster_time_unix_nanos(const bson_t *event) {
     return (int64_t)seconds * INT64_C(1000000000) + (int64_t)increment;
 }
 
+/*
+ * Builds a transaction grouping key from lsid and txnNumber when an event is
+ * part of a MongoDB transaction. NULL means the event is non-transactional.
+ */
 static char *event_transaction_key(const bson_t *event) {
     bson_t lsid;
     bson_iter_t iter;
@@ -1591,6 +1855,10 @@ static char *event_transaction_key(const bson_t *event) {
     return key;
 }
 
+/*
+ * Retrieves the best available resume token for a processed event. libmongoc's
+ * stream token is preferred, with the event `_id` as a fallback.
+ */
 static scribe_error_t stream_resume_token(mongoc_change_stream_t *stream, const bson_t *event, char **out) {
     const bson_t *token = mongoc_change_stream_get_resume_token(stream);
     bson_t event_id;
@@ -1604,6 +1872,11 @@ static scribe_error_t stream_resume_token(mongoc_change_stream_t *stream, const 
     return scribe_set_error(SCRIBE_EADAPTER, "MongoDB change stream event has no resume token");
 }
 
+/*
+ * Adds or commits a data event according to transaction grouping rules.
+ * Non-transactional events commit immediately; transaction events stay batched
+ * until the transaction key changes or the stream is flushed.
+ */
 static scribe_error_t handle_data_event(scribe_ctx *ctx, mongo_watch_batch *batch, const bson_t *event, const char *op,
                                         char **resume_token) {
     mongo_watch_change change;
@@ -1657,6 +1930,11 @@ static scribe_error_t handle_data_event(scribe_ctx *ctx, mongo_watch_batch *batc
     return err;
 }
 
+/*
+ * Handles invalidation and unusable-token recovery. It flushes any current
+ * batch, marks adapter state invalid, writes a new bootstrap commit, and returns
+ * the fresh resume token from the new adapter state.
+ */
 static scribe_error_t restart_bootstrap_after_invalidate(scribe_ctx *ctx, mongoc_client_t *client,
                                                          const mongo_watch_scope *scope, mongo_watch_batch *batch,
                                                          char **resume_token) {
@@ -1690,6 +1968,10 @@ static scribe_error_t restart_bootstrap_after_invalidate(scribe_ctx *ctx, mongoc
     return err;
 }
 
+/*
+ * Main steady-state change stream loop. It opens/reopens streams, consumes
+ * events, drains batches on shutdown, and restarts bootstrap on invalidation.
+ */
 static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client, const mongo_watch_scope *scope,
                                         char **resume_token) {
     scribe_error_t err;
@@ -1795,6 +2077,11 @@ static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client
     return SCRIBE_OK;
 }
 
+/*
+ * Public Mongo adapter entry point used by the CLI. It initializes libmongoc,
+ * opens the client, runs bootstrap when state is missing/invalid, then enters
+ * steady-state change stream consumption.
+ */
 scribe_error_t scribe_mongo_watch_bootstrap(scribe_ctx *ctx, const char *uri) {
     mongoc_client_t *client = NULL;
     mongo_watch_scope scope;
