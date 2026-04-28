@@ -96,6 +96,26 @@ pipe_protocol 1
 store .scribe (not initialized)
 ```
 
+## Versioned Push
+
+Use the versioned push wrapper when pushing release changes to `main`:
+
+```sh
+bash scripts/push-versioned.sh
+```
+
+By default it bumps the patch version, updates `CMakeLists.txt`,
+`include/scribe/scribe.h`, and versioned documentation examples, commits the
+bump, then runs `git push`. Use `minor` or `major` as the first argument for a
+larger bump:
+
+```sh
+bash scripts/push-versioned.sh minor
+```
+
+The script does not create a local tag. GitHub Actions creates `v<version>`
+after the pushed commit passes the quality gate.
+
 ## Quickstart
 
 Start the local single-node MongoDB replica set:
