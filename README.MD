@@ -90,7 +90,7 @@ Verify the binary:
 Example output:
 
 ```text
-scribe version 1.0.1
+scribe version 1.0.2
 hash_algorithm blake3-256
 pipe_protocol 1
 store .scribe (not initialized)

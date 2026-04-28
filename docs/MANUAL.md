@@ -90,7 +90,7 @@ If `libmongoc` and `libbson` are absent, CMake disables `mongo-watch`. Core comm
 Output:
 
 ```text
-scribe version 1.0.1
+scribe version 1.0.2
 hash_algorithm blake3-256
 pipe_protocol 1
 store .scribe (not initialized)
@@ -485,7 +485,7 @@ If the store path does not exist, `info` still prints the binary version, hash a
 Output:
 
 ```text
-scribe version 1.0.1
+scribe version 1.0.2
 hash_algorithm blake3-256
 pipe_protocol 1
 store .scribe (not initialized)
@@ -929,7 +929,7 @@ Command after appending `unknown_key=true` to `.scribe/config`:
 Output:
 
 ```text
-scribe version 1.0.1
+scribe version 1.0.2
 hash_algorithm blake3-256
 pipe_protocol 1
 scribe: SCRIBE_ECONFIG: unknown config key 'unknown_key'
