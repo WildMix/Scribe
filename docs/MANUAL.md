@@ -418,9 +418,13 @@ Output:
 
 ### `log`
 
-Synopsis: `scribe [--store <path>] log [--oneline] [-n <N>]`
+Synopsis: `scribe [--store <path>] log [--oneline] [--paths] [-n <N>] [--] [<path>]`
 
-Walks commit history from HEAD.
+Walks commit history from `HEAD`. By default, every commit in the parent chain is emitted. With a positional `<path>`, only commits where that path's blob or tree hash differs from the parent are emitted. Use `--` before the path when the path could be mistaken for an option.
+
+`--paths` lists changed leaf paths for each emitted commit, prefixed with `A`, `M`, or `D`. For the initial commit, all leaf paths are listed as `A`. In `--oneline` mode, `--paths` appends `[N changed]` instead of listing each path. When a path filter is active, `-n <N>` limits emitted commits, not scanned commits.
+
+The first commit where a filtered path appears is annotated `(added)`. A commit where it disappears is annotated `(deleted)`. Tree-level paths are valid; any change underneath changes the tree hash and matches the filter.
 
 ```sh
 ./build/scribe --store /tmp/scribe-manual-quick/.scribe log --oneline
@@ -431,6 +435,24 @@ Output:
 ```text
 <12-hex> mongo change stream
 <12-hex> mongo bootstrap
+```
+
+```sh
+./build/scribe --store /tmp/scribe-manual-quick/.scribe log --paths -- 'scribe_test/users/"manual-alice"'
+```
+
+Output excerpt:
+
+```text
+commit <64-hex>
+parent <64-hex>
+author unknown <> <unix-nanos>
+committer scribe-mongo <> <unix-nanos>
+
+mongo change stream
+
+  (added)
+  A scribe_test/users/"manual-alice"
 ```
 
 ### `ls-tree`

@@ -464,24 +464,27 @@ scribe_error_t scribe_cli_list_objects(scribe_ctx *ctx, int type_mask_value, int
     return err;
 }
 
-static scribe_error_t find_tree_entry(scribe_tree_entry *entries, size_t count, const char *name, size_t name_len,
-                                      scribe_tree_entry **out) {
+static scribe_tree_entry *find_tree_entry(scribe_tree_entry *entries, size_t count, const char *name, size_t name_len) {
     size_t i;
 
     for (i = 0; i < count; i++) {
         if (entries[i].name_len == name_len && memcmp(entries[i].name, name, name_len) == 0) {
-            *out = &entries[i];
-            return SCRIBE_OK;
+            return &entries[i];
         }
     }
-    return scribe_set_error(SCRIBE_ENOT_FOUND, "path component '%.*s' not found", (int)name_len, name);
+    return NULL;
 }
 
-static scribe_error_t walk_tree_path(scribe_ctx *ctx, const uint8_t root_tree[SCRIBE_HASH_SIZE], const char *path,
-                                     uint8_t out_hash[SCRIBE_HASH_SIZE], uint8_t *out_type) {
+static scribe_error_t resolve_tree_path(scribe_ctx *ctx, const uint8_t root_tree[SCRIBE_HASH_SIZE], const char *path,
+                                        uint8_t out_hash[SCRIBE_HASH_SIZE], uint8_t *out_type, int strict) {
     uint8_t current[SCRIBE_HASH_SIZE];
     const char *part = path;
 
+    if (path == NULL || path[0] == '\0') {
+        scribe_hash_copy(out_hash, root_tree);
+        *out_type = SCRIBE_OBJECT_TREE;
+        return SCRIBE_OK;
+    }
     scribe_hash_copy(current, root_tree);
     while (1) {
         const char *slash = strchr(part, '/');
@@ -493,13 +496,32 @@ static scribe_error_t walk_tree_path(scribe_ctx *ctx, const uint8_t root_tree[SC
         size_t count = 0;
         scribe_error_t err = read_tree_entries(ctx, current, &arena, &entries, &count);
         if (err == SCRIBE_OK) {
-            err = find_tree_entry(entries, count, part, part_len, &entry);
+            entry = find_tree_entry(entries, count, part, part_len);
+            if (entry == NULL) {
+                if (strict) {
+                    err = scribe_set_error(SCRIBE_ENOT_FOUND, "path component '%.*s' not found", (int)part_len, part);
+                } else {
+                    *out_type = 0;
+                    memset(out_hash, 0, SCRIBE_HASH_SIZE);
+                }
+            }
         }
         if (err == SCRIBE_OK) {
+            if (entry == NULL) {
+                scribe_arena_destroy(&arena);
+                return SCRIBE_OK;
+            }
             if (entry->type == SCRIBE_OBJECT_BLOB && !is_last) {
-                err = scribe_set_error(SCRIBE_ENOT_FOUND,
-                                       "path component '%.*s' resolved to a blob; cannot descend further",
-                                       (int)part_len, part);
+                if (strict) {
+                    err = scribe_set_error(SCRIBE_ENOT_FOUND,
+                                           "path component '%.*s' resolved to a blob; cannot descend further",
+                                           (int)part_len, part);
+                } else {
+                    *out_type = 0;
+                    memset(out_hash, 0, SCRIBE_HASH_SIZE);
+                    scribe_arena_destroy(&arena);
+                    return SCRIBE_OK;
+                }
             } else if (is_last) {
                 scribe_hash_copy(out_hash, entry->hash);
                 *out_type = entry->type;
@@ -513,6 +535,29 @@ static scribe_error_t walk_tree_path(scribe_ctx *ctx, const uint8_t root_tree[SC
             return err;
         }
     }
+}
+
+scribe_error_t scribe_tree_resolve_path(scribe_ctx *ctx, const uint8_t root_tree[SCRIBE_HASH_SIZE], const char *path,
+                                        scribe_path_resolution *out) {
+    uint8_t type = 0;
+    scribe_error_t err;
+
+    if (ctx == NULL || root_tree == NULL || path == NULL || out == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid tree path resolution");
+    }
+    memset(out, 0, sizeof(*out));
+    err = resolve_tree_path(ctx, root_tree, path, out->hash, &type, 0);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    if (type == SCRIBE_OBJECT_BLOB) {
+        out->state = SCRIBE_PATH_BLOB;
+    } else if (type == SCRIBE_OBJECT_TREE) {
+        out->state = SCRIBE_PATH_TREE;
+    } else {
+        out->state = SCRIBE_PATH_ABSENT;
+    }
+    return SCRIBE_OK;
 }
 
 static scribe_error_t write_blob_payload(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE]) {
@@ -568,7 +613,7 @@ scribe_error_t scribe_cli_show_path(scribe_ctx *ctx, const char *spec) {
         scribe_hash_copy(target_hash, view.root_tree);
         target_type = SCRIBE_OBJECT_TREE;
     } else {
-        err = walk_tree_path(ctx, view.root_tree, colon + 1, target_hash, &target_type);
+        err = resolve_tree_path(ctx, view.root_tree, colon + 1, target_hash, &target_type, 1);
         if (err != SCRIBE_OK) {
             scribe_arena_destroy(&arena);
             return err;

@@ -74,6 +74,17 @@ typedef struct {
     size_t message_len;
 } scribe_commit_view;
 
+typedef enum {
+    SCRIBE_PATH_ABSENT = 0,
+    SCRIBE_PATH_BLOB = SCRIBE_OBJECT_BLOB,
+    SCRIBE_PATH_TREE = SCRIBE_OBJECT_TREE
+} scribe_path_state;
+
+typedef struct {
+    scribe_path_state state;
+    uint8_t hash[SCRIBE_HASH_SIZE];
+} scribe_path_resolution;
+
 char *scribe_path_join(const char *a, const char *b);
 scribe_error_t scribe_mkdir_p(const char *path);
 scribe_error_t scribe_write_file_atomic(const char *path, const uint8_t *bytes, size_t len);
@@ -120,7 +131,7 @@ scribe_error_t scribe_commit_root_internal(scribe_ctx *ctx, const uint8_t root_t
                                            const scribe_change_batch *metadata,
                                            uint8_t out_commit_hash[SCRIBE_HASH_SIZE]);
 
-scribe_error_t scribe_cli_log(scribe_ctx *ctx, int oneline, size_t limit);
+scribe_error_t scribe_cli_log(scribe_ctx *ctx, int oneline, size_t limit, int show_paths, const char *path_filter);
 scribe_error_t scribe_cli_show(scribe_ctx *ctx, const char *rev);
 scribe_error_t scribe_cli_show_path(scribe_ctx *ctx, const char *spec);
 scribe_error_t scribe_cli_cat_object(scribe_ctx *ctx, char mode, const char *hex);
@@ -129,6 +140,8 @@ scribe_error_t scribe_cli_fsck(scribe_ctx *ctx);
 scribe_error_t scribe_cli_list_objects(scribe_ctx *ctx, int type_mask, int reachable, const char *format);
 scribe_error_t scribe_cli_ls_tree(scribe_ctx *ctx, const char *hex);
 scribe_error_t scribe_resolve_commit(scribe_ctx *ctx, const char *rev, uint8_t out[SCRIBE_HASH_SIZE]);
+scribe_error_t scribe_tree_resolve_path(scribe_ctx *ctx, const uint8_t root_tree[SCRIBE_HASH_SIZE], const char *path,
+                                        scribe_path_resolution *out);
 
 scribe_error_t scribe_pipe_commit_batch(scribe_ctx *ctx, FILE *in, FILE *out);
 

@@ -21,7 +21,7 @@ static void usage(FILE *out) {
                  "      default format: %%H %%T %%S; output is unsorted; %%C stats each object;\n"
                  "      --reachable walks history and keeps an in-memory reachable set\n"
                  "  ls-tree <hash> (recursive, byte-sorted storage order)\n"
-                 "  log [--oneline] [-n <N>]\n"
+                 "  log [--oneline] [--paths] [-n <N>] [--] [<path>]\n"
                  "  show <commit> | show <commit>:<path>\n"
                  "  cat-object (-p|-t|-s) <hash>\n"
                  "  diff <commit1> [<commit2>]\n"
@@ -164,24 +164,42 @@ int main(int argc, char **argv) {
     }
     if (strcmp(cmd, "log") == 0) {
         int oneline = 0;
+        int show_paths = 0;
         size_t limit = 0;
+        const char *path_filter = NULL;
+        int after_separator = 0;
         while (argi < argc) {
-            if (strcmp(argv[argi], "--oneline") == 0) {
+            if (!after_separator && strcmp(argv[argi], "--") == 0) {
+                after_separator = 1;
+                argi++;
+            } else if (!after_separator && strcmp(argv[argi], "--oneline") == 0) {
                 oneline = 1;
                 argi++;
-            } else if (strcmp(argv[argi], "-n") == 0 && argi + 1 < argc) {
+            } else if (!after_separator && strcmp(argv[argi], "--paths") == 0) {
+                show_paths = 1;
+                argi++;
+            } else if (!after_separator && strcmp(argv[argi], "-n") == 0 && argi + 1 < argc) {
                 limit = (size_t)strtoul(argv[argi + 1], NULL, 10);
                 argi += 2;
-            } else {
+            } else if (!after_separator && argv[argi][0] == '-') {
                 usage(stderr);
                 return (int)SCRIBE_EINVAL;
+            } else {
+                if (path_filter != NULL) {
+                    usage(stderr);
+                    return (int)SCRIBE_EINVAL;
+                }
+                path_filter = argv[argi++];
             }
+        }
+        if (path_filter != NULL && path_filter[0] == '\0') {
+            return fail(scribe_set_error(SCRIBE_EINVAL, "log path filter must not be empty"));
         }
         err = open_ctx(store, 0, &ctx);
         if (err != SCRIBE_OK) {
             return fail(err);
         }
-        err = scribe_cli_log(ctx, oneline, limit);
+        err = scribe_cli_log(ctx, oneline, limit, show_paths, path_filter);
         scribe_close(ctx);
         return err == SCRIBE_OK ? 0 : fail(err);
     }

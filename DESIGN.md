@@ -466,7 +466,7 @@ The `scribe` binary is the single entry point. Subcommands:
 | `scribe init <path>`                    | Create a new `.scribe/` store with a config skeleton              |
 | `scribe info`                           | Print version, config, hash algorithm, supported protocol range   |
 | `scribe list-objects [opts]`            | Enumerate store objects; optionally filter by type/reachability   |
-| `scribe log [--oneline] [-n <N>]`       | Walk commit history from HEAD                                     |
+| `scribe log [--oneline] [--paths] [-n <N>] [--] [<path>]` | Walk commit history from HEAD; optionally list changed paths or filter by path |
 | `scribe ls-tree <hash>`                 | List a tree recursively; commit hashes resolve to root trees      |
 | `scribe show <commit>`                  | Print commit metadata + list of touched paths                     |
 | `scribe show <commit>:<path>`           | Print raw blob bytes or list a tree at a path in a commit         |

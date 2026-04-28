@@ -129,6 +129,128 @@ if "$BIN" --store "$STORE" list-objects --format='%X' >"$ROOT/bad-format.out" 2>
 fi
 grep -F 'SCRIBE_EINVAL' "$ROOT/bad-format.err" >/dev/null || fail "invalid format did not use SCRIBE_EINVAL"
 
+LOG_ROOT=$(mktemp -d)
+LOG_STORE="$LOG_ROOT/.scribe"
+"$BIN" init "$LOG_STORE" >/dev/null
+
+log_commit_initial=$(
+    {
+        printf 'BATCH\t1\t1\n'
+        printf 'AUTHOR\ttester\t\ttest\n'
+        printf 'COMMITTER\tscribe-test\t\tscribe\n'
+        printf 'PROCESS\tcli-test\t1\t\tlog-initial\n'
+        printf 'TIMESTAMP\t500\n'
+        printf 'MESSAGE\t0\n'
+        printf 'EVENT\t3\t7\n'
+        printf 'db\nusers\nalice\n'
+        printf '{"v":1}'
+        printf 'END\n'
+    } | "$BIN" --store "$LOG_STORE" commit-batch | awk -F '\t' '$1 == "OK" { print $2 }'
+)
+[ -n "$log_commit_initial" ] || fail "log initial commit was not created"
+
+log_commit_add_bob=$(
+    {
+        printf 'BATCH\t1\t1\n'
+        printf 'AUTHOR\ttester\t\ttest\n'
+        printf 'COMMITTER\tscribe-test\t\tscribe\n'
+        printf 'PROCESS\tcli-test\t1\t\tlog-add-bob\n'
+        printf 'TIMESTAMP\t600\n'
+        printf 'MESSAGE\t0\n'
+        printf 'EVENT\t3\t7\n'
+        printf 'db\nusers\nbob\n'
+        printf '{"v":1}'
+        printf 'END\n'
+    } | "$BIN" --store "$LOG_STORE" commit-batch | awk -F '\t' '$1 == "OK" { print $2 }'
+)
+[ -n "$log_commit_add_bob" ] || fail "log add-bob commit was not created"
+
+log_commit_update_both=$(
+    {
+        printf 'BATCH\t1\t2\n'
+        printf 'AUTHOR\ttester\t\ttest\n'
+        printf 'COMMITTER\tscribe-test\t\tscribe\n'
+        printf 'PROCESS\tcli-test\t1\t\tlog-update-both\n'
+        printf 'TIMESTAMP\t700\n'
+        printf 'MESSAGE\t0\n'
+        printf 'EVENT\t3\t7\n'
+        printf 'db\nusers\nalice\n'
+        printf '{"v":2}'
+        printf 'EVENT\t3\t7\n'
+        printf 'db\nusers\nbob\n'
+        printf '{"v":2}'
+        printf 'END\n'
+    } | "$BIN" --store "$LOG_STORE" commit-batch | awk -F '\t' '$1 == "OK" { print $2 }'
+)
+[ -n "$log_commit_update_both" ] || fail "log update-both commit was not created"
+
+log_commit_delete_bob=$(
+    {
+        printf 'BATCH\t1\t1\n'
+        printf 'AUTHOR\ttester\t\ttest\n'
+        printf 'COMMITTER\tscribe-test\t\tscribe\n'
+        printf 'PROCESS\tcli-test\t1\t\tlog-delete-bob\n'
+        printf 'TIMESTAMP\t800\n'
+        printf 'MESSAGE\t0\n'
+        printf 'EVENT\t3\t0\n'
+        printf 'db\nusers\nbob\n'
+        printf 'END\n'
+    } | "$BIN" --store "$LOG_STORE" commit-batch | awk -F '\t' '$1 == "OK" { print $2 }'
+)
+[ -n "$log_commit_delete_bob" ] || fail "log delete-bob commit was not created"
+
+log_commit_unrelated=$(
+    {
+        printf 'BATCH\t1\t1\n'
+        printf 'AUTHOR\ttester\t\ttest\n'
+        printf 'COMMITTER\tscribe-test\t\tscribe\n'
+        printf 'PROCESS\tcli-test\t1\t\tlog-unrelated\n'
+        printf 'TIMESTAMP\t900\n'
+        printf 'MESSAGE\t0\n'
+        printf 'EVENT\t3\t7\n'
+        printf 'db\naudit\nmarker\n'
+        printf '{"v":1}'
+        printf 'END\n'
+    } | "$BIN" --store "$LOG_STORE" commit-batch | awk -F '\t' '$1 == "OK" { print $2 }'
+)
+[ -n "$log_commit_unrelated" ] || fail "log unrelated commit was not created"
+
+"$BIN" --store "$LOG_STORE" log --oneline -- db/users/alice >"$LOG_ROOT/alice-history"
+alice_lines=$(awk 'END { print NR }' "$LOG_ROOT/alice-history")
+[ "$alice_lines" = "2" ] || fail "path filter for path present from commit 1 emitted $alice_lines commits"
+grep -F "$(printf '%.12s' "$log_commit_initial")" "$LOG_ROOT/alice-history" | grep -F '(added)' >/dev/null ||
+    fail "path filter did not annotate initial alice appearance as added"
+
+"$BIN" --store "$LOG_STORE" log --oneline -- db/users/bob >"$LOG_ROOT/bob-history"
+bob_lines=$(awk 'END { print NR }' "$LOG_ROOT/bob-history")
+[ "$bob_lines" = "3" ] || fail "path filter for added/deleted path emitted $bob_lines commits"
+head -n 1 "$LOG_ROOT/bob-history" | grep -F "$(printf '%.12s' "$log_commit_delete_bob")" | grep -F '(deleted)' >/dev/null ||
+    fail "path filter did not annotate bob deletion"
+tail -n 1 "$LOG_ROOT/bob-history" | grep -F "$(printf '%.12s' "$log_commit_add_bob")" | grep -F '(added)' >/dev/null ||
+    fail "path filter did not annotate bob addition"
+
+"$BIN" --store "$LOG_STORE" log --oneline -- db/users >"$LOG_ROOT/users-tree-history"
+users_tree_lines=$(awk 'END { print NR }' "$LOG_ROOT/users-tree-history")
+[ "$users_tree_lines" = "4" ] || fail "tree-level path filter emitted $users_tree_lines commits"
+if grep -F "$(printf '%.12s' "$log_commit_unrelated")" "$LOG_ROOT/users-tree-history" >/dev/null; then
+    fail "tree-level path filter included unrelated commit"
+fi
+
+"$BIN" --store "$LOG_STORE" log --oneline --paths -n 1 -- db/users/alice >"$LOG_ROOT/alice-oneline-paths"
+alice_oneline_paths=$(cat "$LOG_ROOT/alice-oneline-paths")
+printf '%s\n' "$alice_oneline_paths" | grep -F "$(printf '%.12s' "$log_commit_update_both")" >/dev/null ||
+    fail "-n with path filter did not skip unrelated commits before counting"
+printf '%s\n' "$alice_oneline_paths" | grep -F '[2 changed]' >/dev/null ||
+    fail "--oneline --paths did not append total changed-path count"
+
+"$BIN" --store "$LOG_STORE" log --paths -- db/users/alice >"$LOG_ROOT/alice-full-paths"
+grep -F '  M db/users/alice' "$LOG_ROOT/alice-full-paths" >/dev/null ||
+    fail "--paths omitted filtered path modification"
+grep -F '  M db/users/bob' "$LOG_ROOT/alice-full-paths" >/dev/null ||
+    fail "--paths with a path filter did not list all changes in the commit"
+grep -F '  A db/users/alice' "$LOG_ROOT/alice-full-paths" >/dev/null ||
+    fail "initial commit with --paths did not list alice as added"
+
 LARGE_ROOT=$(mktemp -d)
 LARGE_STORE="$LARGE_ROOT/.scribe"
 LARGE_COUNT=5000

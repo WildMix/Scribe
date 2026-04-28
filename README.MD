@@ -163,7 +163,7 @@ bash scripts/smoke-test.sh
 | `scribe init [path]`                | Create an empty `.scribe/` repository, defaulting to `.scribe` in the current directory. |
 | `scribe info`                       | Print binary and repository configuration information.                                   |
 | `scribe commit-batch`               | Read one pipe protocol v1 batch from stdin and commit it.                                |
-| `scribe log [--oneline] [-n <N>]`   | Walk commit history from `HEAD`.                                                         |
+| `scribe log [--oneline] [--paths] [-n <N>] [--] [<path>]` | Walk commit history, list changed paths, or filter commits by path.                      |
 | `scribe show <commit>`              | Print commit metadata and touched paths.                                                 |
 | `scribe diff <commit1> [<commit2>]` | Show path-level changes between commits.                                                 |
 | `scribe cat-object (-p              | -t                                                                                       |-s) <hash>` | Print object content, type, or payload size. |
