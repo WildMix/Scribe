@@ -168,6 +168,11 @@ int main(int argc, char **argv) {
         size_t limit = 0;
         const char *path_filter = NULL;
         int after_separator = 0;
+        /*
+         * log accepts one optional positional path in addition to flags. "--"
+         * is supported so paths beginning with '-' can still be passed without
+         * being confused for options.
+         */
         while (argi < argc) {
             if (!after_separator && strcmp(argv[argi], "--") == 0) {
                 after_separator = 1;
@@ -261,6 +266,12 @@ int main(int argc, char **argv) {
             usage(stderr);
             return (int)SCRIBE_EINVAL;
         }
+        /*
+         * Most commands accept --store only before the subcommand. mongo-watch
+         * additionally accepts the historical smoke-test form with --store
+         * after the URI because long-running watcher invocations are often
+         * copied from operational examples.
+         */
         uri = argv[argi++];
         if (argi < argc) {
             if (argi + 2 != argc || strcmp(argv[argi], "--store") != 0) {

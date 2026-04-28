@@ -28,6 +28,18 @@ static scribe_error_t build_envelope(uint8_t type, const uint8_t *payload, size_
     size_t leb_len;
     uint8_t *buf;
 
+    /*
+     * Scribe hashes this uncompressed envelope, not the compressed file.
+     * The envelope gives every object a typed byte representation:
+     *
+     *   byte 0                  object type: blob/tree/commit
+     *   bytes 1..N              unsigned LEB128 payload length
+     *   remaining bytes         raw payload
+     *
+     * Hashing the type and length along with the payload prevents a blob,
+     * tree, and commit with identical payload bytes from sharing a hash, and it
+     * lets readers reject truncated or overlong decompressed data.
+     */
     leb_len = scribe_leb128_encode((uint64_t)payload_len, leb);
     buf = (uint8_t *)malloc(1u + leb_len + payload_len);
     if (buf == NULL) {
@@ -50,6 +62,12 @@ char *scribe_object_path(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE]) 
     char *dir;
     char *path;
 
+    /*
+     * Loose objects are sharded by the first two hex characters:
+     * objects/ab/cdef... instead of objects/abcdef... This keeps directory
+     * sizes reasonable for large v1 stores and matches the
+     * iterator layout used by list-objects and fsck.
+     */
     scribe_hash_to_hex(hash, hex);
     objects = scribe_path_join(ctx->repo_path, "objects");
     if (objects == NULL) {
@@ -95,6 +113,16 @@ scribe_error_t scribe_object_write(scribe_ctx *ctx, uint8_t type, const uint8_t 
     if (payload == NULL && payload_len != 0) {
         return scribe_set_error(SCRIBE_EINVAL, "payload is NULL with non-zero length");
     }
+    /*
+     * Write path:
+     *   1. build the uncompressed typed envelope;
+     *   2. hash the envelope to get the content address;
+     *   3. skip the write if that object already exists;
+     *   4. compress the envelope and atomically publish the loose object file.
+     *
+     * The idempotent "already exists" case matters because the same MongoDB
+     * document bytes can be observed repeatedly and should reuse one blob.
+     */
     err = build_envelope(type, payload, payload_len, &envelope, &envelope_len);
     if (err != SCRIBE_OK) {
         return err;
@@ -176,6 +204,13 @@ scribe_error_t scribe_object_read(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HAS
     if (err != SCRIBE_OK) {
         return err;
     }
+    /*
+     * Read path is deliberately strict. A caller asking for hash H receives an
+     * object only if the file decompresses cleanly, the decompressed envelope
+     * rehashes to H, and the embedded payload length exactly matches the
+     * remaining bytes. This is the verification that fsck relies on, and every
+     * command that reads objects gets the same corruption checks for free.
+     */
     frame_len = ZSTD_getFrameContentSize(compressed, compressed_len);
     if (frame_len == ZSTD_CONTENTSIZE_ERROR || frame_len == ZSTD_CONTENTSIZE_UNKNOWN) {
         free(compressed);
@@ -257,6 +292,14 @@ static scribe_error_t visit_object_file(const char *name, void *vctx) {
     uint8_t hash[SCRIBE_HASH_SIZE];
     scribe_error_t err;
 
+    /*
+     * Ignore files that do not look like loose object names. Operators may
+     * leave editor temp files or
+     * filesystem metadata in objects/; those should
+     * not break iteration. A file that has a valid object-shaped
+     * name but bad
+     * contents will still fail later when the visitor reads it.
+     */
     if (strlen(name) != 62u || !is_hex_string(name, 62u)) {
         return SCRIBE_OK;
     }

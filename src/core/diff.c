@@ -27,6 +27,11 @@ scribe_error_t scribe_resolve_commit(scribe_ctx *ctx, const char *rev, uint8_t o
     if (rev == NULL || strcmp(rev, "HEAD") == 0) {
         return scribe_refs_read(ctx, "refs/heads/main", out);
     }
+    /*
+     * v1 intentionally supports only a tiny revision language: HEAD, HEAD~N,
+     * or a full 64-hex hash. HEAD~N is resolved by repeatedly parsing parent
+     * commits; abbreviated hashes are display-only and are not accepted here.
+     */
     if (strncmp(rev, "HEAD~", 5) == 0) {
         char *end = NULL;
         unsigned long n = strtoul(rev + 5, &end, 10);
@@ -83,6 +88,12 @@ static scribe_error_t count_diff_visit(char status, const char *path, void *user
 }
 
 static int path_resolution_changed(const scribe_path_resolution *parent, const scribe_path_resolution *current) {
+    /*
+     * Path-history filtering compares object identity, not blob contents. A
+     * tree-level filter works because any child change produces a different
+     * tree hash; a blob-level filter works because changed payload bytes produce
+     * a different blob hash.
+     */
     if (parent->state != current->state) {
         return 1;
     }
@@ -162,6 +173,12 @@ scribe_error_t scribe_cli_log(scribe_ctx *ctx, int oneline, size_t limit, int sh
             parent_root = parent_view.root_tree;
             have_parent_view = 1;
         }
+        /*
+         * A path filter affects only which commits are emitted. The scan still
+         * walks every parent commit until history ends or the emitted-count
+         * limit is reached, so "-n 3 -- path" means "three commits that changed
+         * path", not "scan three commits total".
+         */
         if (path_filter != NULL) {
             scribe_path_resolution current_path;
             scribe_path_resolution parent_path;
@@ -434,6 +451,11 @@ static scribe_error_t parse_tree_object(scribe_ctx *ctx, const uint8_t hash[SCRI
 
 static scribe_error_t report_all(scribe_ctx *ctx, char status, const uint8_t hash[SCRIBE_HASH_SIZE], uint8_t type,
                                  const char *path, diff_visit_fn visit, void *user) {
+    /*
+     * When an entire subtree is added or deleted, user-facing diff output is
+     * still leaf-oriented. Descend until blobs are reached and report every leaf
+     * path with the same status.
+     */
     if (type == SCRIBE_OBJECT_BLOB) {
         return visit(status, path, user);
     }
@@ -504,6 +526,11 @@ static scribe_error_t diff_trees(scribe_ctx *ctx, const uint8_t a_hash[SCRIBE_HA
         scribe_arena_destroy(&arena_b);
         return err;
     }
+    /*
+     * Both tree payloads are strictly byte-sorted by name. This lets diff use a
+     * merge walk: names that exist only on the left are deletions, only on the
+     * right are additions, and matching names recurse or become modifications.
+     */
     while (ai < ac || bi < bc) {
         int cmp;
         char *path;

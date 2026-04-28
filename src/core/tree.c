@@ -34,6 +34,13 @@ scribe_error_t scribe_tree_serialize(const scribe_tree_entry *entries, size_t co
     if (out == NULL || out_len == NULL || arena == NULL || (count != 0 && entries == NULL)) {
         return scribe_set_error(SCRIBE_EINVAL, "invalid tree serialization");
     }
+    /*
+     * Tree objects are canonical: callers may provide entries in any order, but
+     * the serialized payload is
+     * sorted byte-for-byte by name and rejects
+     * duplicates. This makes identical logical trees hash identically and keeps
+     * diff/log walks deterministic.
+     */
     sorted = (scribe_tree_entry *)scribe_arena_alloc(arena, sizeof(*sorted) * (count == 0 ? 1u : count),
                                                      _Alignof(scribe_tree_entry));
     if (sorted == NULL) {
@@ -53,6 +60,12 @@ scribe_error_t scribe_tree_serialize(const scribe_tree_entry *entries, size_t co
         if (i > 0 && entry_cmp(&sorted[i - 1u], &sorted[i]) == 0) {
             return scribe_set_error(SCRIBE_EINVAL, "duplicate tree entry name");
         }
+        /*
+         * Entry payload format:
+         *   type byte, child hash, unsigned LEB128 name length, name bytes.
+         * Names are not NUL-terminated on disk; parse creates arena-owned
+         * NUL-terminated copies for C convenience.
+         */
         leb_len = scribe_leb128_encode((uint64_t)sorted[i].name_len, leb);
         len += 1u + SCRIBE_HASH_SIZE + leb_len + sorted[i].name_len;
     }
@@ -83,6 +96,14 @@ scribe_error_t scribe_tree_parse_arena_capacity(size_t payload_len, size_t *out)
     if (payload_len > (SIZE_MAX - 4096u) / 8u) {
         return scribe_set_error(SCRIBE_ENOMEM, "tree payload is too large");
     }
+    /*
+     * Parsing creates an array of entries and copies every name into the arena.
+     * The exact count is not
+     * known without parsing, so callers use this
+     * conservative bound to avoid the fixed-size arena exhaustion
+     * bugs that
+     * large collections previously exposed.
+     */
     *out = payload_len * 8u + 4096u;
     return SCRIBE_OK;
 }
@@ -138,6 +159,13 @@ scribe_error_t scribe_tree_parse(const uint8_t *payload, size_t len, scribe_aren
         entries[count].name = name;
         entries[count].name_len = (size_t)name_len64;
         off += entries[count].name_len;
+        /*
+         * Because serialized trees must be strictly sorted, a repeated name or
+         * out-of-order entry
+         * is corrupt. Enforcing this during parse lets later
+         * code use simple merge walks without defensive
+         * duplicate resolution.
+         */
         if (count > 0 && entry_cmp(&entries[count - 1u], &entries[count]) >= 0) {
             return scribe_set_error(SCRIBE_ECORRUPT, "tree entries are not strictly sorted");
         }

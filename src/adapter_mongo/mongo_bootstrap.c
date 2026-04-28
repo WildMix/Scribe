@@ -217,6 +217,14 @@ static scribe_error_t task_queue_init(mongo_task_queue *q, size_t capacity) {
     return SCRIBE_OK;
 }
 
+/*
+ * Bootstrap is the only v1 workload that does substantial parallel work. The
+ * main thread enumerates MongoDB documents and pushes bson copies into this
+ * bounded queue. Worker threads pop tasks, canonicalize BSON to deterministic
+ * JSON bytes, derive the database/collection/document-id path, and append their
+ * results to a mutex-protected vector. The bounded queue prevents a very large
+ * collection from being copied entirely into memory before workers catch up.
+ */
 static void task_queue_destroy(mongo_task_queue *q) {
     pthread_cond_destroy(&q->not_full);
     pthread_cond_destroy(&q->not_empty);
@@ -558,6 +566,13 @@ static scribe_error_t process_task(mongo_task *task, mongo_result *out) {
     const char **path;
     scribe_error_t err;
 
+    /*
+     * The Scribe path for MongoDB is always exactly three components:
+     * database, collection, canonical _id. The payload is the complete canonical
+     * Extended JSON document. Hashing the payload here is not required for
+     * object storage, but it makes worker results deterministic and was used
+     * during verification/debugging of bootstrap ordering.
+     */
     memset(out, 0, sizeof(*out));
     err = scribe_mongo_canonicalize_id(task->doc, &id);
     if (err != SCRIBE_OK) {
@@ -595,6 +610,11 @@ static scribe_error_t process_task(mongo_task *task, mongo_result *out) {
 static void *worker_main(void *arg) {
     mongo_worker_ctx *ctx = (mongo_worker_ctx *)arg;
 
+    /*
+     * Workers keep draining until task_queue_close() has been called and the
+     * queue is empty. A worker records the first error it sees in its context;
+     * the main bootstrap thread reports that error during cleanup.
+     */
     for (;;) {
         mongo_task *task = task_queue_pop(ctx->queue);
         mongo_result result;
@@ -879,6 +899,13 @@ static scribe_error_t write_adapter_state(scribe_ctx *ctx, const char *resume_to
     int n;
     scribe_error_t err;
 
+    /*
+     * Adapter state is the durability boundary between MongoDB and Scribe.
+     * Write it only after the corresponding commit has been written and
+     * refs/heads/main has advanced. If Scribe exits after the commit but before
+     * this file update, restart may replay from an older token, but the commit
+     * path is deterministic and ref CAS prevents silent history corruption.
+     */
     dir = scribe_path_join(ctx->repo_path, "adapter-state");
     if (dir == NULL) {
         return SCRIBE_ENOMEM;
@@ -933,6 +960,11 @@ static scribe_error_t read_adapter_state(scribe_ctx *ctx, char **out_resume_toke
     char *nl;
     scribe_error_t err;
 
+    /*
+     * Keep this parser deliberately strict. The state file is a tiny
+     * three-line text file; accepting extra lines or missing fields would make
+     * resume behavior ambiguous and harder to diagnose.
+     */
     if (out_resume_token == NULL) {
         return scribe_set_error(SCRIBE_EINVAL, "invalid adapter state output");
     }
@@ -1002,6 +1034,12 @@ static scribe_error_t commit_results(scribe_ctx *ctx, mongo_results *results, ui
     size_t i;
     scribe_error_t err;
 
+    /*
+     * Bootstrap results are first assembled into an in-memory snapshot tree,
+     * then written as immutable Scribe tree objects. The commit contains no
+     * per-document events because a bootstrap is a baseline snapshot, not a
+     * change stream batch.
+     */
     root = snapshot_node_new();
     if (root == NULL) {
         return scribe_set_error(SCRIBE_ENOMEM, "failed to allocate Mongo snapshot root");
@@ -1042,6 +1080,12 @@ static scribe_error_t run_bootstrap(scribe_ctx *ctx, mongoc_client_t *client, co
     char *start_resume_token = NULL;
     scribe_error_t err;
 
+    /*
+     * Capture a resume token before scanning. The resulting bootstrap commit is
+     * a snapshot at approximately that point in the stream; after the commit
+     * lands, change-stream consumption resumes from the captured token so writes
+     * that race with the scan are replayed through steady state.
+     */
     err = capture_start_resume_token(client, scope, &start_resume_token);
     if (err != SCRIBE_OK) {
         return err;
@@ -1188,6 +1232,12 @@ static scribe_error_t watch_batch_add(mongo_watch_batch *batch, mongo_watch_chan
     if (watch_batch_reserve(batch) != SCRIBE_OK) {
         return SCRIBE_ENOMEM;
     }
+    /*
+     * Ownership moves into the batch: change path/payload and the resume token
+     * are nulled in the caller after this succeeds. The batch stores the newest
+     * resume token it has seen so adapter-state can resume after the last event
+     * included in the commit.
+     */
     if (batch->count == 0) {
         batch->timestamp_unix_nanos = timestamp_unix_nanos;
     }
@@ -1207,6 +1257,12 @@ static scribe_error_t watch_batch_commit(scribe_ctx *ctx, mongo_watch_batch *wat
     size_t i;
     scribe_error_t err;
 
+    /*
+     * The commit must land before adapter-state is updated. This ordering is
+     * what makes SIGTERM safe: on restart, Scribe either resumes before an
+     * uncommitted event or after a committed event, but never records a token
+     * for data that failed to enter history.
+     */
     if (watch_batch->count == 0) {
         return SCRIBE_OK;
     }
@@ -1283,6 +1339,12 @@ static scribe_error_t open_change_stream(mongoc_client_t *client, const mongo_wa
     if (resume_token_unusable != NULL) {
         *resume_token_unusable = 0;
     }
+    /*
+     * The watch is either cluster-scoped or database-scoped depending on the URI.
+     * fullDocument=updateLookup makes updates commit the full post-image
+     * document, while fullDocumentBeforeChange=whenAvailable asks MongoDB for
+     * pre-images without requiring them for all deployments.
+     */
     bson_init(&pipeline);
     bson_init(&opts);
     BSON_APPEND_UTF8(&opts, "fullDocument", "updateLookup");
@@ -1417,6 +1479,11 @@ static scribe_error_t build_watch_change(const bson_t *event, const char *op, mo
     const char **path;
     scribe_error_t err;
 
+    /*
+     * Deletes are tombstones: path with NULL payload. All other data events use
+     * fullDocument and store the canonical whole document, not a JSON patch or
+     * field-level delta. Core Scribe stays format-agnostic after this point.
+     */
     memset(out, 0, sizeof(*out));
     err = event_namespace(event, &db, &coll);
     if (err != SCRIBE_OK) {
@@ -1487,6 +1554,11 @@ static char *event_transaction_key(const bson_t *event) {
     char *key;
     int n;
 
+    /*
+     * MongoDB emits every write in a transaction as a separate change stream
+     * event. Group them by canonical lsid plus txnNumber so Scribe writes one
+     * commit for the whole transaction instead of one commit per document.
+     */
     if (event_document(event, "lsid", &lsid) != SCRIBE_OK) {
         return NULL;
     }
@@ -1539,6 +1611,11 @@ static scribe_error_t handle_data_event(scribe_ctx *ctx, mongo_watch_batch *batc
     int64_t ts = event_cluster_time_unix_nanos(event);
     scribe_error_t err;
 
+    /*
+     * Non-transactional writes commit immediately as one-event batches. A
+     * transaction stays open until a different transaction key appears, a
+     * non-data event forces a flush, shutdown drains it, or the stream ends.
+     */
     memset(&change, 0, sizeof(change));
     err = build_watch_change(event, op, &change);
     if (err != SCRIBE_OK) {
@@ -1585,6 +1662,12 @@ static scribe_error_t restart_bootstrap_after_invalidate(scribe_ctx *ctx, mongoc
                                                          char **resume_token) {
     scribe_error_t err;
 
+    /*
+     * Invalidate/drop/rename and unusable resume-token errors mean the current
+     * stream position cannot be trusted. Preserve old history, mark the old
+     * token invalid for diagnostics, write a new bootstrap commit parented to
+     * existing history, and then reopen the watch from the new token.
+     */
     err = watch_batch_commit(ctx, batch);
     if (err != SCRIBE_OK) {
         return err;
@@ -1611,6 +1694,12 @@ static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client
                                         char **resume_token) {
     scribe_error_t err;
 
+    /*
+     * Outer loop owns stream creation/recreation. Inner loop consumes events
+     * from one stream. Shutdown does not interrupt an in-flight transaction or
+     * batch: the loop breaks only after watch_batch_commit() has drained the
+     * current data into Scribe history and adapter-state.
+     */
     while (!g_shutdown_requested) {
         mongoc_change_stream_t *stream = NULL;
         mongo_watch_batch batch;

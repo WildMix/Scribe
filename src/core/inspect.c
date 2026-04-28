@@ -168,6 +168,12 @@ static scribe_error_t print_tree_entries_recursive(scribe_ctx *ctx, const uint8_
     size_t i;
     scribe_error_t err;
 
+    /*
+     * ls-tree is recursive by design. Print the current entry first, then
+     * descend into subtrees using the full path assembled so far. The path is
+     * not shell-quoted because Scribe path components cannot contain tabs or
+     * newlines, and Mongo-shaped paths are meant to be copied exactly.
+     */
     err = read_tree_entries(ctx, tree_hash, &arena, &entries, &count);
     if (err != SCRIBE_OK) {
         scribe_arena_destroy(&arena);
@@ -330,6 +336,12 @@ static scribe_error_t walk_reachable_object(hash_set *set, scribe_ctx *ctx, cons
 }
 
 static scribe_error_t build_reachable_set(scribe_ctx *ctx, hash_set *set) {
+    /*
+     * list-objects --reachable uses the same graph idea as fsck: start at
+     * refs/heads/main, follow every parent commit, and follow every root tree
+     * down to blobs. The result is held in memory and then used as a filter over
+     * the object-store iterator.
+     */
     uint8_t head[SCRIBE_HASH_SIZE];
     scribe_error_t err = scribe_refs_read(ctx, "refs/heads/main", head);
 
@@ -348,6 +360,10 @@ static scribe_error_t validate_format(const char *format) {
     if (format == NULL || format[0] == '\0') {
         return scribe_set_error(SCRIBE_EINVAL, "list-objects format is empty");
     }
+    /*
+     * Validate the whole template before iterating objects. That way a typo
+     * such as %X fails immediately instead of printing a partial object list.
+     */
     for (p = format; *p != '\0'; p++) {
         if (*p != '%') {
             continue;
@@ -480,6 +496,12 @@ static scribe_error_t resolve_tree_path(scribe_ctx *ctx, const uint8_t root_tree
     uint8_t current[SCRIBE_HASH_SIZE];
     const char *part = path;
 
+    /*
+     * Path resolution is shared by "show commit:path" and log path filtering.
+     * strict=1 gives user-facing ENOT_FOUND diagnostics; strict=0 turns missing
+     * paths and attempts to descend through blobs into an ABSENT result so log
+     * can compare "present vs absent" across commits.
+     */
     if (path == NULL || path[0] == '\0') {
         scribe_hash_copy(out_hash, root_tree);
         *out_type = SCRIBE_OBJECT_TREE;
@@ -589,6 +611,12 @@ scribe_error_t scribe_cli_show_path(scribe_ctx *ctx, const char *spec) {
     scribe_commit_view view;
     scribe_error_t err;
 
+    /*
+     * Split only on the first colon. The left side is a commit revision and the
+     * right side is a raw slash-separated tree path. No escaping or path
+     * normalization is attempted; callers should quote the whole shell argument
+     * when the path contains JSON braces or quotes.
+     */
     if (colon == NULL || colon == spec) {
         return scribe_set_error(SCRIBE_EINVAL, "invalid commit:path argument");
     }

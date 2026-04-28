@@ -21,6 +21,13 @@ static int invalid_field(const char *s, int required) {
 static scribe_error_t validate_batch(const scribe_change_batch *batch, int allow_empty) {
     size_t i;
 
+    /*
+     * The commit payload is line-oriented text, so fields that become headers
+     * cannot contain tabs or newlines. Event paths also reject tabs/newlines so
+     * tree listing and diff output remain unambiguous. A NULL payload with
+     * length zero is the only tombstone representation; a non-NULL payload must
+     * have nonzero length.
+     */
     if (batch == NULL || (!allow_empty && (batch->events == NULL || batch->event_count == 0)) ||
         (batch->events == NULL && batch->event_count != 0) || (batch->events != NULL && batch->event_count == 0)) {
         return scribe_set_error(SCRIBE_EMALFORMED, "batch must contain at least one event");
@@ -82,6 +89,14 @@ static scribe_error_t commit_serialize_ex(const uint8_t root_tree[SCRIBE_HASH_SI
     if (validate_batch(batch, allow_empty) != SCRIBE_OK) {
         return SCRIBE_EMALFORMED;
     }
+    /*
+     * Commit payloads intentionally stay human-readable. Header lines are
+     * separated from the message by a
+     * blank line. The message is copied as raw
+     * bytes after that blank line and may contain arbitrary content;
+     * parsers do
+     * not attempt to interpret it.
+     */
     cap = 512u + batch->message_len + strlen(batch->author.name) + strlen(batch->author.email) +
           strlen(batch->author.source) + strlen(batch->committer.name) + strlen(batch->committer.email) +
           strlen(batch->committer.source) + strlen(batch->process.name) + strlen(batch->process.version) +
@@ -179,6 +194,14 @@ scribe_error_t scribe_commit_parse(const uint8_t *payload, size_t len, scribe_ar
     int saw_process = 0;
 
     memset(out, 0, sizeof(*out));
+    /*
+     * Parsing works on an arena-owned mutable copy because split_tabs() and
+     * next_line() replace
+     * separators with NUL bytes. The returned view points
+     * into that arena copy, so callers must keep the arena
+     * alive while using the
+     * commit fields.
+     */
     copy = scribe_arena_strdup_len(arena, (const char *)payload, len);
     if (copy == NULL) {
         return SCRIBE_ENOMEM;

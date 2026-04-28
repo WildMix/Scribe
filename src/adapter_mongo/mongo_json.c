@@ -68,6 +68,13 @@ static scribe_error_t decode_json_string(parser *p, const char *raw, size_t raw_
     size_t off = 1;
     size_t used = 0;
 
+    /*
+     * Object-key sorting uses decoded key bytes. libbson emits canonical
+     * Extended JSON with escaped non-ASCII when needed; for v1 sorting we keep
+     * escaped Unicode sequences as literal escape bytes instead of implementing
+     * full Unicode normalization. The important property is deterministic
+     * ordering for the JSON libbson actually emits.
+     */
     if (raw_len < 2 || raw[0] != '"' || raw[raw_len - 1u] != '"') {
         return scribe_set_error(SCRIBE_EMALFORMED, "invalid JSON string");
     }
@@ -274,6 +281,11 @@ static scribe_error_t parse_object(parser *p, json_value **out) {
         }
         if (p->pos < p->len && p->s[p->pos] == '}') {
             p->pos++;
+            /*
+             * Canonicalization sorts object members by decoded key. Values are
+             * otherwise preserved exactly as parsed, so Scribe core never adds
+             * MongoDB semantics beyond deterministic key order.
+             */
             qsort(v->pairs, v->pair_count, sizeof(v->pairs[0]), pair_cmp);
             *out = v;
             return SCRIBE_OK;
@@ -402,6 +414,12 @@ scribe_error_t scribe_mongo_canonicalize_json(const char *json, char **out, size
     if (json == NULL || out == NULL || out_len == NULL) {
         return scribe_set_error(SCRIBE_EINVAL, "invalid JSON canonicalization argument");
     }
+    /*
+     * This is a small canonicalizer for libbson's canonical Extended JSON
+     * output. It parses enough JSON to reorder object keys recursively and
+     * serializes without insignificant whitespace. Arrays preserve order, and
+     * strings/atoms preserve their raw spelling.
+     */
     memset(&p, 0, sizeof(p));
     p.s = json;
     p.len = strlen(json);
@@ -459,6 +477,13 @@ scribe_error_t scribe_mongo_canonicalize_id(const bson_t *doc, char **out) {
     const char *prefix = "{\"v\":";
     size_t prefix_len = strlen(prefix);
 
+    /*
+     * Reuse the document canonicalizer for _id by wrapping the BSON value in a
+     * temporary object {"v": <id>}. After canonicalization, strip the wrapper
+     * and use only the canonical value as the tree leaf name. That is why string
+     * ids appear as quoted JSON strings, while ObjectId values appear as
+     * {"$oid":"..."}.
+     */
     if (!bson_iter_init_find(&iter, doc, "_id")) {
         return scribe_set_error(SCRIBE_EADAPTER, "MongoDB document is missing _id");
     }

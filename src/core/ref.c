@@ -20,6 +20,11 @@ scribe_error_t scribe_lock_repo(scribe_ctx *ctx) {
     if (path == NULL) {
         return SCRIBE_ENOMEM;
     }
+    /*
+     * The lock file serves two purposes. flock() on the open descriptor is the
+     * actual exclusion mechanism; the file contents are only diagnostics so a
+     * second writer can tell the operator which process currently owns the repository.
+     */
     ctx->lock_fd = open(path, O_RDWR | O_CREAT, 0666);
     free(path);
     if (ctx->lock_fd < 0) {
@@ -73,6 +78,11 @@ scribe_error_t scribe_refs_read(scribe_ctx *ctx, const char *name, uint8_t out[S
     if (err != SCRIBE_OK) {
         return err;
     }
+    /*
+     * Refs are intentionally tiny text files: exactly 64 lowercase hex
+     * characters plus newline. HEAD is a symbolic file in v1, but actual refs
+     * such as refs/heads/main use this direct hash format.
+     */
     if (len != SCRIBE_HEX_HASH_SIZE + 1u || bytes[SCRIBE_HEX_HASH_SIZE] != '\n') {
         free(bytes);
         return scribe_set_error(SCRIBE_ECORRUPT, "malformed ref '%s'", name);
@@ -90,6 +100,13 @@ scribe_error_t scribe_refs_cas(scribe_ctx *ctx, const char *name, const uint8_t 
     char *path;
     scribe_error_t err;
 
+    /*
+     * Compare-and-swap protects the single main ref from accidental overwrite.
+     * Writers first remember the parent hash they read, then publish only if the
+     * ref still has that value. In normal v1 operation the repository lock means
+     * this should succeed, but the CAS also protects against future embedding or
+     * lock misuse.
+     */
     err = scribe_refs_read(ctx, name, current);
     if (err == SCRIBE_ENOT_FOUND) {
         if (expected != NULL) {

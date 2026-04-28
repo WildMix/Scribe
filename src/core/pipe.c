@@ -132,6 +132,14 @@ static scribe_error_t parse_one_batch(FILE *in, char *first_line, scribe_change_
     scribe_change_event *events;
     scribe_error_t err;
 
+    /*
+     * The pipe protocol is a hybrid text/binary frame. Header lines and path
+     * components are
+     * newline-delimited text, but message and payload bytes are
+     * read by exact byte count. That lets adapters
+     * send arbitrary blob bytes
+     * without escaping them, while keeping framing easy to debug with a terminal.
+ */
     memset(batch, 0, sizeof(*batch));
     if (split_tabs(first_line, parts, 3u) != 3u || strcmp(parts[0], "BATCH") != 0) {
         return scribe_set_error(SCRIBE_EPROTOCOL, "expected BATCH line");
@@ -253,6 +261,11 @@ static scribe_error_t parse_one_batch(FILE *in, char *first_line, scribe_change_
                 goto done;
             }
         }
+        /*
+         * payload_len == 0 means tombstone/delete. Empty blobs are not
+         * representable in v1 because the public change event API uses
+         * payload == NULL and payload_len == 0 as the delete marker.
+         */
         if (payload_len != 0) {
             uint8_t *payload = (uint8_t *)malloc(payload_len);
             if (payload == NULL) {
@@ -298,6 +311,14 @@ static void write_error(FILE *out, scribe_error_t err) {
 
 static scribe_error_t commit_via_queue(scribe_ctx *ctx, scribe_change_batch *batch,
                                        uint8_t commit_hash[SCRIBE_HASH_SIZE]) {
+    /*
+     * The CLI is single-process, but this still routes the batch through the
+     * same SPSC queue abstraction
+     * used by library/adapter paths. That keeps the
+     * pipe command exercising queue behavior instead of calling
+     * the commit
+     * builder directly.
+     */
     scribe_spsc_queue q;
     void *dequeued = NULL;
     scribe_error_t err =
@@ -320,6 +341,14 @@ scribe_error_t scribe_pipe_commit_batch(scribe_ctx *ctx, FILE *in, FILE *out) {
     char *line = NULL;
     size_t cap = 0;
 
+    /*
+     * Accept multiple BATCH frames on one stdin stream. Each successful frame
+     * commits independently and
+     * emits its own OK line. The first malformed frame
+     * emits ERR and stops; continuing after malformed framing
+     * would risk reading
+     * binary payload bytes as protocol lines.
+     */
     while (getline(&line, &cap, in) >= 0) {
         scribe_change_batch batch;
         uint8_t commit_hash[SCRIBE_HASH_SIZE];

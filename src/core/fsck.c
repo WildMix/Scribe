@@ -15,6 +15,15 @@ typedef struct {
     size_t dangling;
 } fsck_state;
 
+/*
+ * fsck keeps an in-memory set of hashes reached from refs/heads/main. The set
+ * is intentionally simple because v1 fsck is an operator diagnostic command,
+ * not a high-throughput query path. The visited set has two jobs:
+ *
+ *   1. avoid walking the same object more than once when multiple commits share
+ *      subtrees or blobs;
+ *   2. identify dangling loose objects during the later full object scan.
+ */
 static int visited_has(fsck_state *st, const uint8_t hash[SCRIBE_HASH_SIZE]) {
     size_t i;
 
@@ -63,6 +72,12 @@ static scribe_error_t fsck_walk_tree(fsck_state *st, scribe_object *obj) {
     if (err != SCRIBE_OK) {
         return err;
     }
+    /*
+     * Tree parsing checks the tree payload itself: entry type bytes, name
+     * lengths, strictly sorted names, and duplicate prevention. Each entry also
+     * tells fsck what object type should be found at the child hash; a mismatch
+     * is corruption because parent objects define the type contract.
+     */
     err = scribe_tree_parse(obj->payload, obj->payload_len, &arena, &entries, &count);
     if (err != SCRIBE_OK) {
         scribe_arena_destroy(&arena);
@@ -88,6 +103,12 @@ static scribe_error_t fsck_walk_commit(fsck_state *st, scribe_object *obj) {
     if (err != SCRIBE_OK) {
         return err;
     }
+    /*
+     * Commit parsing validates the text headers. The reachability graph then
+     * follows both edges a commit can name: the root tree and the optional
+     * parent commit. Following the whole parent chain is what lets fsck decide
+     * whether an old blob/tree is still reachable through history.
+     */
     err = scribe_commit_parse(obj->payload, obj->payload_len, &arena, &view);
     if (err != SCRIBE_OK) {
         scribe_arena_destroy(&arena);
@@ -109,6 +130,11 @@ static scribe_error_t fsck_walk_object(fsck_state *st, const uint8_t hash[SCRIBE
     if (err != SCRIBE_OK || already) {
         return err;
     }
+    /*
+     * scribe_object_read performs the envelope and BLAKE3 verification. fsck
+     * adds graph-level checks on top of that: referenced objects must exist and
+     * their actual type must match the type recorded by the parent tree or ref.
+     */
     err = scribe_object_read(st->ctx, hash, &obj);
     if (err != SCRIBE_OK) {
         return err == SCRIBE_ENOT_FOUND ? scribe_set_error(SCRIBE_ECORRUPT, "missing reachable object") : err;
@@ -145,6 +171,12 @@ static scribe_error_t visit_object_file(const char *name, void *vctx) {
     if (err != SCRIBE_OK) {
         return SCRIBE_OK;
     }
+    /*
+     * Dangling means "present in objects/ but absent from the reachability set
+     * built from refs/heads/main". It is only a warning in v1. Interrupted
+     * writes may leave valid objects on disk before the ref update publishes a
+     * commit, and Scribe has no garbage collector yet.
+     */
     if (!visited_has(dctx->st, hash)) {
         printf("warning: dangling object %s\n", hex);
         dctx->st->dangling++;

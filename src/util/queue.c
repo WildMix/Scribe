@@ -48,6 +48,12 @@ scribe_error_t scribe_spsc_queue_push(scribe_spsc_queue *q, void *item) {
     if (q == NULL) {
         return scribe_set_error(SCRIBE_EINVAL, "queue is NULL");
     }
+    /*
+     * This is a bounded single-producer/single-consumer queue, but it still
+     * uses a mutex/condition pair rather than lock-free atomics. The queue is
+     * on the adapter/pipe boundary where clarity and predictable blocking matter
+     * more than raw nanosecond latency.
+     */
     pthread_mutex_lock(&q->mu);
     while (q->count == q->capacity) {
         if (q->stall_warn_seconds > 0) {
@@ -56,6 +62,12 @@ scribe_error_t scribe_spsc_queue_push(scribe_spsc_queue *q, void *item) {
             make_deadline(&deadline, q->stall_warn_seconds);
             rc = pthread_cond_timedwait(&q->not_full, &q->mu, &deadline);
             if (rc == ETIMEDOUT) {
+                /*
+                 * The queue does not log directly because util/queue has no
+                 * repository context. It records that a full-queue wait crossed
+                 * the configured threshold so callers can inspect the condition
+                 * or extend this with contextual logging later.
+                 */
                 q->warned_full = 1;
             }
         } else {

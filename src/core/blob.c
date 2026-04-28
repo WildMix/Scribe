@@ -50,6 +50,12 @@ static scribe_error_t node_reserve(scribe_arena *arena, tree_node *node) {
         return SCRIBE_OK;
     }
     new_cap = node->cap == 0 ? 8u : node->cap * 2u;
+    /*
+     * tree_node is an arena-backed editable view of a persistent tree. Growing
+     * an arena allocation cannot free the old entries, so this is a copy-grow:
+     * allocate a larger array, copy existing entries, and leave the old array
+     * to be reclaimed when the whole work arena is destroyed.
+     */
     grown = (node_entry *)scribe_arena_alloc(arena, sizeof(*grown) * new_cap, _Alignof(node_entry));
     if (grown == NULL) {
         return SCRIBE_ENOMEM;
@@ -169,6 +175,12 @@ static scribe_error_t load_tree(scribe_ctx *ctx, scribe_arena *work, const uint8
     scribe_error_t err;
     size_t arena_capacity = 0;
 
+    /*
+     * Existing persistent trees are immutable object payloads. To apply a new
+     * batch, Scribe first expands the current root tree into mutable tree_node
+     * objects allocated from the work arena. Blob entries keep only their hash;
+     * subtree entries recursively get editable child nodes.
+     */
     err = scribe_object_read(ctx, hash, &obj);
     if (err != SCRIBE_OK) {
         return err;
@@ -232,6 +244,12 @@ static scribe_error_t estimate_tree_work_capacity(scribe_ctx *ctx, const uint8_t
     size_t parse_capacity = 0;
     scribe_error_t err;
 
+    /*
+     * Loading large Mongo collections can require many tree entries and path
+     * strings. Before allocating the work arena, walk the existing tree and add
+     * a conservative parse capacity for every subtree so updates to large stores
+     * do not fail with arena exhaustion.
+     */
     err = scribe_object_read(ctx, hash, &obj);
     if (err != SCRIBE_OK) {
         return err;
@@ -275,6 +293,12 @@ static scribe_error_t apply_change(scribe_ctx *ctx, scribe_arena *work, tree_nod
     tree_node *node = root;
     size_t i;
 
+    /*
+     * Each event path is a sequence of tree components followed by one leaf.
+     * Intermediate components must be trees. Missing intermediate trees are
+     * created on demand. A NULL payload is a tombstone and deletes the leaf;
+     * otherwise the payload is written as a blob and the leaf is set to that blob hash.
+     */
     for (i = 0; i + 1u < ev->path_len; i++) {
         ssize_t idx = node_find(node, ev->path[i]);
         tree_node *child;
@@ -317,6 +341,13 @@ static scribe_error_t write_tree_recursive(scribe_ctx *ctx, tree_node *node, uin
     scribe_error_t err;
     size_t arena_capacity = 0;
 
+    /*
+     * After all events are applied, the mutable tree is collapsed back into
+     * immutable tree objects bottom-up. Child trees are written first so their
+     * hashes can be placed in the parent tree entry array. Unchanged subtrees
+     * naturally reuse their existing hash because tree serialization is
+     * canonical and object writes are content-addressed.
+     */
     err = tree_write_arena_capacity(node, &arena_capacity);
     if (err == SCRIBE_OK) {
         err = scribe_arena_init(&arena, arena_capacity);
@@ -359,6 +390,11 @@ static scribe_error_t read_head_root_hash(scribe_ctx *ctx, uint8_t parent_hash[S
                                           uint8_t root_hash[SCRIBE_HASH_SIZE]) {
     scribe_error_t err;
 
+    /*
+     * The current root tree is not stored separately from commits. To append a
+     * normal change batch, read refs/heads/main, parse the commit it points to,
+     * and take that commit's root tree as the editable base.
+     */
     err = scribe_refs_read(ctx, "refs/heads/main", parent_hash);
     if (err == SCRIBE_ENOT_FOUND) {
         *has_parent = 0;
@@ -414,6 +450,16 @@ scribe_error_t scribe_commit_batch_internal(scribe_ctx *ctx, const scribe_change
     if (ctx == NULL || !ctx->writable) {
         return scribe_set_error(SCRIBE_EINVAL, "writable context required");
     }
+    /*
+     * Commit publication order is important:
+     *   1. read the current main ref and root tree;
+     *   2. write all new blob/tree/commit objects;
+     *   3. atomically compare-and-swap refs/heads/main to the new commit.
+     *
+     * If the process dies before step 3, objects may be left on disk but are
+     * unreachable. That is allowed in v1 and is exactly what fsck reports as
+     * dangling. If step 3 fails because the ref changed, history is not overwritten.
+     */
     err = read_head_root_hash(ctx, parent_hash, &has_parent, parent_root_hash);
     if (err != SCRIBE_OK) {
         return err;
@@ -493,6 +539,11 @@ scribe_error_t scribe_commit_root_internal(scribe_ctx *ctx, const uint8_t root_t
     if (ctx == NULL || !ctx->writable) {
         return scribe_set_error(SCRIBE_EINVAL, "writable context required");
     }
+    /*
+     * Bootstrap already constructed and wrote the complete snapshot tree. This
+     * helper wraps that root tree in a commit and advances the ref, using the
+     * same parent/ref CAS rules as normal event batches.
+     */
     err = scribe_refs_read(ctx, "refs/heads/main", parent_hash);
     if (err == SCRIBE_ENOT_FOUND) {
         has_parent = 0;

@@ -99,6 +99,12 @@ scribe_error_t scribe_read_config(const char *repo_path, scribe_config *cfg) {
     unsigned seen = 0;
     scribe_error_t err;
 
+    /*
+     * Start from defaults, then require every v1 key to appear in the file.
+     * Defaults give the struct known values while parsing, but the final "seen"
+     * mask prevents partially written or hand-trimmed config files from being
+     * accepted silently.
+     */
     err = scribe_default_config(cfg);
     if (err != SCRIBE_OK) {
         return err;
@@ -202,6 +208,11 @@ scribe_error_t scribe_read_config(const char *repo_path, scribe_config *cfg) {
             }
             seen |= 1u << 10;
         } else {
+            /*
+             * Unknown keys are configuration errors rather than warnings. This
+             * catches misspellings such as worker_thread before an operator
+             * assumes the setting is active.
+             */
             free(bytes);
             return scribe_set_error(SCRIBE_ECONFIG, "unknown config key '%s'", key);
         }

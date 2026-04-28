@@ -18,6 +18,11 @@ scribe_error_t scribe_init_repository(const char *path) {
     if (path == NULL || path[0] == '\0') {
         return scribe_set_error(SCRIBE_EPATH, "empty repository path");
     }
+    /*
+     * init creates only the repository skeleton. refs/heads/main is deliberately
+     * absent until the first commit, so an empty repository can be distinguished
+     * from a repository whose main ref points at a commit.
+     */
     err = scribe_default_config(&cfg);
     if (err != SCRIBE_OK) {
         return err;
@@ -65,6 +70,12 @@ scribe_error_t scribe_open(const char *path, int writable, scribe_ctx **out) {
     if (path == NULL || out == NULL) {
         return scribe_set_error(SCRIBE_EINVAL, "invalid open arguments");
     }
+    /*
+     * Open centralizes per-command setup: read SCRIBE_LOG_LEVEL, allocate the
+     * context, parse config, optionally acquire the writer lock, and open the
+     * operational log. Read-only commands skip the lock because objects are
+     * immutable and refs are replaced atomically.
+     */
     err = scribe_log_configure_from_env();
     if (err != SCRIBE_OK) {
         return err;
