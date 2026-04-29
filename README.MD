@@ -308,3 +308,93 @@ Local formatting check:
 ```sh
 find src include tests -name '*.[ch]' -print0 | xargs -0 clang-format --dry-run --Werror
 ```
+
+## Security Review
+
+The following review was performed against the `main` branch on 2026-04-29. It
+covers the entire first-party tree (no per-PR scope).
+
+### Scope
+
+Reviewed all first-party source on `main`:
+
+- **CLI**: `src/cli/main.c`
+- **Public API**: `include/scribe/scribe.h`
+- **Core library** (14 files): `src/core/blob.c`, `commit.c`, `config.c`,
+  `context.c`, `diff.c`, `fs.c`, `fsck.c`, `inspect.c`, `internal.h`,
+  `library.c`, `object.c`, `pipe.c`, `ref.c`, `tree.c`
+- **MongoDB adapter**: `src/adapter_mongo/mongo_bootstrap.c` (2139 lines),
+  `mongo_json.c` (596 lines), plus headers
+- **Utilities**: `arena.c`, `error.c`, `hex.c`, `leb128.c`, `log.c`, `queue.c`
+- **Build/CI**: `CMakeLists.txt`, `.github/workflows/ci.yml`
+- **Scripts**: `scripts/push-versioned.sh`, `smoke-test.sh`,
+  `install-deps-{ubuntu,macos}.sh`
+- **Docker fixtures**: `docker/mongo-init.js`, `docker/docker-compose.yml`
+- **Integration tests**: `tests/integration/test_cli_features.sh`
+
+Out of scope: vendored code (`vendor/blake3`, `vendor/zstd`, `vendor/unity`),
+markdown documentation, unit tests under `tests/unit/`.
+
+### Findings
+
+**No HIGH or MEDIUM severity findings with confidence ≥ 8.**
+
+### Why no findings emerged
+
+Each category in the methodology was traced to a sink and verified safe:
+
+- **Path traversal**: all filesystem paths are built as
+  `scribe_path_join(ctx->repo_path, X)` where `X` is a hardcoded suffix
+  (`"objects"`, `"refs/heads"`, `"config"`, etc.) or an entry name read from
+  `readdir()` and strictly validated as 2 or 62 lowercase hex characters
+  (`src/core/object.c:352, 380`). MongoDB-supplied fields (`ns.db`, `ns.coll`,
+  `_id`) become tree-entry names inside binary tree object payloads, never
+  filesystem paths. Object paths use `scribe_hash_to_hex(hash)`. Ref names are
+  the hardcoded literal `"refs/heads/main"` everywhere.
+- **Command injection**: zero `system()`, `popen()`, or `exec*()` call sites in
+  any C source (verified by grep).
+- **NoSQL injection**: the only Mongo queries are `bson_init(&query)` (empty
+  filter) and `mongoc_database_get_collection_names_with_opts(..., NULL, ...)`.
+  No query is built by string concatenation.
+- **Format-string bugs**: every `printf` / `fprintf` / `vsnprintf` call uses a
+  string-literal format. Untrusted strings always pass through `%s` or `%.*s`.
+- **Unsafe string functions**: all 5 `strcpy` sites are safe — 4 copy from
+  string literals; the 5th (`src/core/config.c:228`) is preceded by an explicit
+  `strlen(value) >= sizeof(...)` length check at line 224.
+- **Integer overflow**: every `malloc(a + b)` with attacker-influenced inputs
+  is preceded by `checked_add_size()` (`blob.c:172`, `inspect.c:179`,
+  `mongo_bootstrap.c:574`, `diff.c:464`). The theoretical
+  `scribe_arena_strdup_len(..., SIZE_MAX)` wraparound requires a caller already
+  holding a SIZE_MAX-sized buffer and is not reachable.
+- **LEB128 decoding**: loop bounded `i < 10u` so shift can reach 63 but never
+  70 — no UB (`src/util/leb128.c:41`).
+- **JSON parsing** (`mongo_json.c`): the output buffer is allocated `raw_len`
+  bytes; decoded output never exceeds input size. Malformed strings are
+  rejected via explicit checks.
+- **Pipe-protocol parsing**: `parse_size_field` accepts wraparound from
+  `strtoul` for negative inputs, but every downstream `calloc` / `malloc`
+  returns NULL on huge sizes and the error propagates safely.
+- **Hardcoded credentials**: `docker/mongo-init.js` and
+  `docker/docker-compose.yml` are local-only fixtures bound to
+  `127.0.0.1:27018`; not production credentials.
+- **GitHub Actions** (`.github/workflows/ci.yml`): triggers are `push` and
+  `pull_request` only (not `pull_request_target`), so PR runs use a read-only
+  `GITHUB_TOKEN`. The `release` job is gated by
+  `github.event_name == 'push' && github.ref == 'refs/heads/main'`. The `$tag`
+  variable is derived from a sed pattern restricted to
+  `[0-9]+\.[0-9]+\.[0-9]+`, so command injection is not possible.
+- **Privilege boundaries**: no setuid/setgid handling in the binary. The CLI
+  runs at operator privilege, bounded to what the operator already has.
+- **MongoDB adapter trust boundary**: a hostile MongoDB server returning
+  malicious change-stream events cannot drive Scribe into filesystem
+  traversal, command execution, or memory corruption — all event fields land
+  in tree-object payload bytes or canonical-JSON blobs in the
+  content-addressed object store.
+
+### Conclusion
+
+The Scribe codebase shows consistent defensive C engineering: explicit
+`checked_add_size` overflow guards, hex-validated path components,
+content-addressed object paths derived from BLAKE3, libmongoc/libbson for all
+Mongo I/O, hardcoded `refs/heads/main`, and zero shell-out call sites. No
+exploitable HIGH or MEDIUM vulnerabilities were identified.
