@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -1322,7 +1323,8 @@ static scribe_error_t run_bootstrap(scribe_ctx *ctx, mongoc_client_t *client, co
     }
     if (err == SCRIBE_OK) {
         scribe_hash_to_hex(commit_hash, commit_hex);
-        scribe_log_msg(ctx, SCRIBE_LOG_INFO, "mongo", "bootstrap commit %s", commit_hex);
+        scribe_log_msg(ctx, SCRIBE_LOG_INFO, "mongo", "bootstrap commit %s with %zu document(s)", commit_hex,
+                       results.count);
     }
     results_destroy(&results);
     task_queue_destroy(&queue);
@@ -1363,6 +1365,7 @@ typedef struct {
     const char **path;
     uint8_t *payload;
     size_t payload_len;
+    char operation[8];
 } mongo_watch_change;
 
 typedef struct {
@@ -1460,6 +1463,30 @@ static scribe_error_t watch_batch_add(mongo_watch_batch *batch, mongo_watch_chan
 }
 
 /*
+ * Emits the human-scannable commit summary requested for mongo-watch. The
+ * commit has already been written and adapter-state has already been persisted
+ * when this helper runs, so every printed line describes durable history. A
+ * single-event commit fits on one line; transaction batches get one commit
+ * header followed by the per-document operations contained in that commit.
+ */
+static void watch_batch_log_commit_summary(scribe_ctx *ctx, const char *commit_hex,
+                                           const mongo_watch_batch *watch_batch) {
+    size_t i;
+
+    if (watch_batch->count == 1u) {
+        const mongo_watch_change *change = &watch_batch->items[0];
+        scribe_log_plain(ctx, "commit %.7s  %s %s/%s/%s", commit_hex, change->operation, change->path[0],
+                         change->path[1], change->path[2]);
+        return;
+    }
+    scribe_log_plain(ctx, "commit %.7s  transaction %zu events", commit_hex, watch_batch->count);
+    for (i = 0; i < watch_batch->count; i++) {
+        const mongo_watch_change *change = &watch_batch->items[i];
+        scribe_log_plain(ctx, "  %s %s/%s/%s", change->operation, change->path[0], change->path[1], change->path[2]);
+    }
+}
+
+/*
  * Commits the current watch batch to Scribe and then persists adapter state.
  * Empty batches are a no-op; nonempty batches transfer their change events into
  * a normal scribe_change_batch.
@@ -1510,8 +1537,7 @@ static scribe_error_t watch_batch_commit(scribe_ctx *ctx, mongo_watch_batch *wat
         return err;
     }
     scribe_hash_to_hex(commit_hash, commit_hex);
-    scribe_log_msg(ctx, SCRIBE_LOG_INFO, "mongo", "change stream commit %s with %zu event(s)", commit_hex,
-                   watch_batch->count);
+    watch_batch_log_commit_summary(ctx, commit_hex, watch_batch);
     watch_batch_clear(watch_batch);
     return SCRIBE_OK;
 }
@@ -1782,6 +1808,7 @@ static scribe_error_t build_watch_change(const bson_t *event, const char *op, mo
     out->path = path;
     out->payload = payload;
     out->payload_len = payload_len;
+    (void)snprintf(out->operation, sizeof(out->operation), "%s", op);
     return SCRIBE_OK;
 }
 

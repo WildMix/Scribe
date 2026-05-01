@@ -146,6 +146,13 @@ In another terminal, insert a document:
 docker compose -f docker/docker-compose.yml exec -T mongo mongosh mongodb://localhost:27017/scribe_test?replicaSet=scribe-rs --quiet --eval "db.users.insertOne({_id:'alice',role:'admin'})"
 ```
 
+The adapter prints a compact commit summary after the commit and resume state are
+durable:
+
+```text
+commit <7-hex>  insert scribe_test/users/"alice"
+```
+
 Stop the adapter with `Ctrl-C` or `SIGTERM`, then inspect history:
 
 ```sh
@@ -192,7 +199,7 @@ Most commands accept `--store <path>` before the command. Commands that read obj
 | `scribe cat-object (-p|-t|-s) <hash>` | Reads one object by full hash and prints the payload, type, or uncompressed payload size. It does not resolve `HEAD` or abbreviated hashes. |
 | `scribe list-objects [opts]` | Iterates the object store. By default it includes all loose objects, including dangling ones. With `--reachable`, it first walks from `HEAD` and prints only objects reachable from main history. |
 | `scribe fsck` | Walks all objects reachable from `refs/heads/main`, verifies every referenced object read, then scans `objects/` for loose objects not visited by that walk and reports them as dangling warnings. |
-| `scribe mongo-watch <uri>` | Acquires the writer lock, bootstraps MongoDB state into a baseline commit when needed, resumes or opens a change stream, converts data events to commits, logs ignored DDL events, and persists adapter state only after commit success. |
+| `scribe mongo-watch <uri>` | Acquires the writer lock, bootstraps MongoDB state into a baseline commit when needed, resumes or opens a change stream, converts data events to commits, logs ignored DDL events, persists adapter state only after commit success, and prints concise `commit <short-hash> <operation> <path>` summaries for data commits. |
 
 `mongo-watch` also accepts the smoke-test form:
 

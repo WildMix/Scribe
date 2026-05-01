@@ -594,7 +594,7 @@ scribe_error_t scribe_commit_batch_internal(scribe_ctx *ctx, const scribe_change
     if (err != SCRIBE_OK) {
         return err;
     }
-    scribe_log_msg(ctx, SCRIBE_LOG_INFO, "commit", "wrote commit");
+    scribe_log_msg(ctx, SCRIBE_LOG_DEBUG, "commit", "wrote commit");
     scribe_log_flush(ctx);
     return SCRIBE_OK;
 }
@@ -647,7 +647,7 @@ scribe_error_t scribe_commit_root_internal(scribe_ctx *ctx, const uint8_t root_t
     if (err != SCRIBE_OK) {
         return err;
     }
-    scribe_log_msg(ctx, SCRIBE_LOG_INFO, "commit", "wrote commit");
+    scribe_log_msg(ctx, SCRIBE_LOG_DEBUG, "commit", "wrote commit");
     scribe_log_flush(ctx);
     return SCRIBE_OK;
 }

@@ -139,9 +139,9 @@ Start the MongoDB adapter in one terminal. The Docker fixture publishes host por
 Output excerpt:
 
 ```text
-<iso8601> INFO commit wrote commit
-<iso8601> INFO mongo bootstrap commit <64-hex>
+<iso8601> INFO mongo bootstrap commit <64-hex> with <N> document(s)
 <iso8601> INFO mongo watching MongoDB change stream
+commit <7-hex>  insert scribe_test/users/"manual-alice"
 ```
 
 In another terminal, write one document. This uses the `mongosh` binary inside the compose container, so a host `mongosh` install is not required:
@@ -634,8 +634,24 @@ The resume token is the MongoDB BSON resume token encoded as base64 so it can be
 Output excerpt:
 
 ```text
-<iso8601> INFO mongo bootstrap commit <64-hex>
+<iso8601> INFO mongo bootstrap commit <64-hex> with <N> document(s)
 <iso8601> INFO mongo watching MongoDB change stream
+```
+
+After each change-stream commit lands and adapter state is persisted, `mongo-watch` prints a plain commit summary line without the normal log prefix:
+
+```text
+commit <7-hex>  insert scribe_test/users/"alice"
+commit <7-hex>  update scribe_test/users/"alice"
+commit <7-hex>  delete scribe_test/users/"alice"
+```
+
+For a multi-document transaction, one Scribe commit is still written. The adapter prints one commit header plus the operations contained in that commit:
+
+```text
+commit <7-hex>  transaction 2 events
+  update scribe_test/users/"alice"
+  insert scribe_test/orders/"o_4913"
 ```
 
 ### `show`

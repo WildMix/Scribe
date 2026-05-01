@@ -505,7 +505,7 @@ adapter.mongodb.coalesce_window_ms = 0
 
 Scribe writes two log streams:
 
-**Stderr.** Human-readable one-line-per-event messages for operational visibility when run interactively. Format: `<iso8601-utc> <level> <component> <message>`. Levels: `DEBUG`, `INFO`, `WARN`, `ERROR`. Default level `INFO`, overridable via `SCRIBE_LOG_LEVEL` environment variable.
+**Stderr.** Human-readable one-line-per-event messages for operational visibility when run interactively. Diagnostic lines use `<iso8601-utc> <level> <component> <message>`. Levels: `DEBUG`, `INFO`, `WARN`, `ERROR`. Default level `INFO`, overridable via `SCRIBE_LOG_LEVEL` environment variable. MongoDB change-stream commit summaries are intentionally plain operator lines, for example `commit 7c2af9b  update orders/o_4912`, so a busy watch stream can be scanned without repeated timestamp and level prefixes.
 
 **`.scribe/log`.** Append-only operational log on disk, same format as stderr. Not rotated in v1; grows unbounded. Entries are flushed after each commit. Not a crash-recovery log — it is purely operational.
 

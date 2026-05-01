@@ -130,6 +130,28 @@ void scribe_log_msg(scribe_ctx *ctx, scribe_log_level level, const char *compone
 }
 
 /*
+ * Writes an operator-facing event line without the timestamp/level/component
+ * prefix. MongoDB change-stream commit summaries use this path because they are
+ * closer to command output than diagnostics: the important data is the commit
+ * hash, operation, and affected document path, and repeating INFO metadata on
+ * every commit makes a busy watch stream harder to scan.
+ */
+void scribe_log_plain(scribe_ctx *ctx, const char *fmt, ...) {
+    char message[768];
+    va_list ap;
+
+    va_start(ap, fmt);
+    (void)vsnprintf(message, sizeof(message), fmt, ap);
+    va_end(ap);
+
+    fprintf(stderr, "%s\n", message);
+    if (ctx != NULL && ctx->log_file != NULL) {
+        fprintf(ctx->log_file, "%s\n", message);
+        fflush(ctx->log_file);
+    }
+}
+
+/*
  * Flushes the repository log stream when one is open. Long-running adapters use
  * this at important boundaries so recent diagnostics are not left only in libc
  * buffers during shutdown.
