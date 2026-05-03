@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(scribe VERSION 1.1.0 LANGUAGES C)
+project(scribe VERSION 1.1.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -11,6 +11,7 @@ option(SCRIBE_BUILD_MONGO_ADAPTER "Build MongoDB adapter" ON)
 option(SCRIBE_BUILD_TESTS "Build tests" ON)
 option(SCRIBE_ENABLE_ASAN "Enable ASan/UBSan" OFF)
 option(SCRIBE_ENABLE_TSAN "Enable TSan" OFF)
+option(SCRIBE_ENABLE_TESTCONTAINERS "Build Docker-backed Testcontainers integration tests" OFF)
 option(SCRIBE_VENDORED_ZSTD "Use vendored zstd" ON)
 
 if(SCRIBE_ENABLE_ASAN AND SCRIBE_ENABLE_TSAN)
@@ -154,4 +155,48 @@ if(SCRIBE_BUILD_TESTS)
     add_test(NAME scribe_tests COMMAND scribe_tests)
     add_test(NAME scribe_cli_features
         COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_cli_features.sh" $<TARGET_FILE:scribe_cli>)
+
+    if(SCRIBE_ENABLE_TESTCONTAINERS)
+        if(NOT SCRIBE_BUILD_MONGO_ADAPTER)
+            message(FATAL_ERROR "SCRIBE_ENABLE_TESTCONTAINERS requires SCRIBE_BUILD_MONGO_ADAPTER=ON")
+        endif()
+        if(CMAKE_VERSION VERSION_LESS 3.26)
+            message(FATAL_ERROR "Testcontainers Native requires CMake 3.26 or newer")
+        endif()
+
+        find_program(DOCKER_EXECUTABLE docker REQUIRED)
+
+        include(FetchContent)
+        set(SKIP_DEMOS TRUE CACHE BOOL "" FORCE)
+        FetchContent_Declare(testcontainers_native
+            GIT_REPOSITORY https://github.com/testcontainers/testcontainers-native.git
+            GIT_TAG 2f659b90fedb74a3227a5a4171ef2b6f61195e4c)
+        FetchContent_MakeAvailable(testcontainers_native)
+
+        add_executable(scribe_mongo_integration_tests
+            tests/integration/test_mongo_testcontainers.c)
+        target_include_directories(scribe_mongo_integration_tests
+            PRIVATE src)
+        target_include_directories(scribe_mongo_integration_tests
+            SYSTEM PRIVATE ${MONGOC_INCLUDE_DIRS} ${BSON_INCLUDE_DIRS})
+        target_link_directories(scribe_mongo_integration_tests
+            PRIVATE ${MONGOC_LIBRARY_DIRS} ${BSON_LIBRARY_DIRS})
+        target_link_libraries(scribe_mongo_integration_tests
+            PRIVATE testcontainers-c ${MONGOC_LIBRARIES} ${BSON_LIBRARIES} scribe_warnings)
+        scribe_apply_sanitizers(scribe_mongo_integration_tests)
+
+        add_test(NAME scribe_testcontainers_mongo_image
+            COMMAND ${DOCKER_EXECUTABLE} build -t scribe-mongo-rs-test:7
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/mongo-rs")
+        set_tests_properties(scribe_testcontainers_mongo_image PROPERTIES
+            FIXTURES_SETUP scribe_mongo_image
+            LABELS "integration;mongo;testcontainers")
+
+        add_test(NAME scribe_mongo_testcontainers
+            COMMAND scribe_mongo_integration_tests $<TARGET_FILE:scribe_cli>)
+        set_tests_properties(scribe_mongo_testcontainers PROPERTIES
+            FIXTURES_REQUIRED scribe_mongo_image
+            LABELS "integration;mongo;testcontainers"
+            TIMEOUT 180)
+    endif()
 endif()

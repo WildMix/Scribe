@@ -75,6 +75,19 @@ Expected test summary:
 100% tests passed, 0 tests failed out of 2
 ```
 
+The thorough MongoDB integration suite is opt-in because it uses Docker,
+Testcontainers Native, and Go to build the Testcontainers bridge:
+
+```sh
+cmake -B build-it -DCMAKE_BUILD_TYPE=Debug -DSCRIBE_BUILD_MONGO_ADAPTER=ON -DSCRIBE_ENABLE_TESTCONTAINERS=ON
+cmake --build build-it -j
+ctest --test-dir build-it -L testcontainers --output-on-failure
+```
+
+That suite starts a real `mongo:7` replica set through Testcontainers, runs
+`mongo-watch`, mutates MongoDB with `libmongoc`, and verifies bootstrap, change
+streams, transactions, DDL recovery, CLI inspection, and fsck behavior.
+
 The CLI binary is:
 
 ```text
@@ -90,7 +103,7 @@ Verify the binary:
 Example output:
 
 ```text
-scribe version 1.1.0
+scribe version 1.1.1
 hash_algorithm blake3-256
 pipe_protocol 1
 store .scribe (not initialized)

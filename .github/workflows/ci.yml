@@ -98,6 +98,24 @@ jobs:
       - name: Smoke test
         run: bash scripts/smoke-test.sh
 
+  testcontainers-mongo:
+    name: testcontainers-mongo
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo bash scripts/install-deps-ubuntu.sh
+          sudo apt-get install -y golang-go
+      - name: Configure
+        run: cmake -B build-it -DCMAKE_BUILD_TYPE=Debug -DSCRIBE_BUILD_MONGO_ADAPTER=ON -DSCRIBE_ENABLE_TESTCONTAINERS=ON
+      - name: Build
+        run: cmake --build build-it -j
+      - name: Testcontainers Mongo tests
+        run: ctest --test-dir build-it -L testcontainers --output-on-failure
+
   format:
     name: format
     runs-on: ubuntu-24.04
@@ -111,7 +129,7 @@ jobs:
   quality-gate:
     name: quality gate
     runs-on: ubuntu-24.04
-    needs: [version, build-linux, sanitizers, smoke, format]
+    needs: [version, build-linux, sanitizers, smoke, testcontainers-mongo, format]
     if: always()
     steps:
       - name: Check required jobs
@@ -131,6 +149,7 @@ jobs:
           check_result build-linux "${{ needs.build-linux.result }}"
           check_result sanitizers "${{ needs.sanitizers.result }}"
           check_result smoke "${{ needs.smoke.result }}"
+          check_result testcontainers-mongo "${{ needs.testcontainers-mongo.result }}"
           check_result format "${{ needs.format.result }}"
           if [ "$failed" -ne 0 ]; then
             echo "::error title=Quality gate failed::One or more required jobs failed, were cancelled, or were skipped"
