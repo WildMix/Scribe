@@ -390,12 +390,14 @@ last_updated <iso8601>
 
 Updated via temp-file + atomic rename *after* the corresponding commit has been durably written. Read at startup to resume; absent means bootstrap is required. If MongoDB rejects the saved token at stream-open time with `cannot resume stream` / `resume token was not found`, v1 marks the token invalid, runs bootstrap again, writes a new baseline commit parented to the existing history, persists the replacement token, and enters steady-state watch.
 
-**Change event kinds.** The MongoDB change stream emits many event types; see §20 for the per-type reference documents. v1 handles them as follows:
+**Change event kinds.** The MongoDB change stream emits many event types; see §20 for the per-type reference documents. v1's Mongo adapter is a document-state adapter, not a MongoDB audit-log adapter: Scribe records canonical document bytes at `database/collection/document-id` paths and does not model collection options, indexes, validators, shard metadata, or the fact that a database/collection exists while empty. That boundary drives the event policy:
 
-- `insert`, `update`, `replace`, `modify`, `delete` — data mutations; each produces a `scribe_change_event` (insert/update/replace/modify → payload; delete → tombstone). Batched by transaction when applicable.
-- `create`, `drop`, `dropDatabase`, `rename` — DDL events. v1 logs these at INFO level and ignores them for commit purposes. Subsequent data events on the recreated/renamed collection will naturally appear at the new path. v2 may promote these to first-class commits.
-- `createIndexes`, `dropIndexes`, `refineCollectionShardKey`, `reshardCollection`, `shardCollection` — schema/sharding events. Logged and ignored for commit purposes in v1.
-- `invalidate` — the change stream is no longer valid. Logged at WARN level; v1 marks the token invalid, runs bootstrap again, writes a new baseline commit parented to existing history, persists the replacement token, and enters steady-state watch.
+- `insert`, `update`, `replace`, `modify`, `delete` — document data mutations; each produces a `scribe_change_event` (insert/update/replace/modify → payload; delete → tombstone). Batched by transaction when applicable.
+- `create` — catalog-only DDL. v1 logs it and ignores it for commit purposes because an empty collection has no representation in the v1 tree. The first inserted document in that collection will create the corresponding Scribe path.
+- `createIndexes`, `dropIndexes`, `refineCollectionShardKey`, `reshardCollection`, `shardCollection` — schema/sharding metadata. v1 logs and ignores these because the object model intentionally stores document contents only.
+- `drop`, `dropDatabase`, `rename`, `invalidate` — stream-boundary or subtree-changing events. MongoDB can invalidate the stream and does not provide one per-document delete/move event that v1 can safely replay. v1 therefore marks the resume token invalid, runs bootstrap again, writes a new baseline commit parented to existing history, persists the replacement token, and enters steady-state watch. The bootstrap commit's root tree represents the current MongoDB state, so a tree diff against the previous commit shows removed or moved documents even though the DDL operation itself is not a first-class commit.
+
+DDL events as first-class commits are *Open (v2)*.
 
 Application-level author attribution (identifying the service or human that issued the write, not just the DB user) is *Open (v2)*.
 

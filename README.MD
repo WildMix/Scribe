@@ -90,7 +90,7 @@ Verify the binary:
 Example output:
 
 ```text
-scribe version 1.0.2
+scribe version 1.1.0
 hash_algorithm blake3-256
 pipe_protocol 1
 store .scribe (not initialized)
@@ -232,8 +232,9 @@ MongoDB event handling in v1:
 - `insert`, `update`, `replace`, and `modify` commit the canonical full document.
 - `delete` commits a tombstone for the document path.
 - Multi-document transactions become one Scribe commit.
-- DDL and sharding events are logged and ignored.
-- `invalidate`, `drop`, `rename`, and `dropDatabase` trigger a new bootstrap.
+- `create` is logged and ignored because an empty collection has no document path in the v1 tree; later inserts into that collection are captured normally.
+- Index, schema, and sharding events are logged and ignored because v1 stores document contents only, not MongoDB catalog metadata.
+- `invalidate`, `drop`, `rename`, and `dropDatabase` trigger a new bootstrap. These events can invalidate the stream or change/remove an entire subtree without one replayable per-document event. The new bootstrap commit records the current MongoDB document state; diffs against the previous commit show the removed or moved documents, but the DDL operation itself is not a first-class commit in v1.
 
 Adapter state is stored in:
 

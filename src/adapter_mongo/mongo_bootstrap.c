@@ -1686,6 +1686,11 @@ static scribe_error_t event_operation(const bson_t *event, const char **out) {
 /*
  * Classifies MongoDB operationType values into data events Scribe commits,
  * invalidation events that restart bootstrap, and DDL/schema events that are logged.
+ * v1 records document state, not MongoDB catalog metadata, so catalog-only
+ * events such as create/createIndexes do not become commits. Destructive DDL is
+ * different: drop/rename/dropDatabase can invalidate the stream or change a
+ * whole subtree without per-document events, so bootstrap is the conservative
+ * way to converge Scribe's root tree to MongoDB's current state.
  */
 static mongo_event_kind classify_operation(const char *op) {
     if (strcmp(op, "insert") == 0 || strcmp(op, "update") == 0 || strcmp(op, "replace") == 0 ||

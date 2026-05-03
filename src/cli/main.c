@@ -19,27 +19,146 @@
 #endif
 
 /*
- * Prints the command summary used for invalid arguments and --help. The help
- * text intentionally includes operational notes for list-objects because its
- * ordering and `%C` cost can surprise users.
+ * Prints the command summary used for invalid arguments and --help. Keep this
+ * text synchronized with the parser below: Scribe intentionally has one
+ * top-level help page rather than per-command help in v1.
  */
 static void usage(FILE *out) {
-    fprintf(out, "usage: scribe [--store <path>] <command> [args]\n"
-                 "\n"
-                 "commands:\n"
-                 "  init [path]\n"
-                 "  info\n"
-                 "  list-objects [--type=blob|tree|commit] [--reachable] [--format=<spec>]\n"
-                 "      default format: %%H %%T %%S; output is unsorted; %%C stats each object;\n"
-                 "      --reachable walks history and keeps an in-memory reachable set\n"
-                 "  ls-tree <hash> (recursive, byte-sorted storage order)\n"
-                 "  log [--oneline] [--paths] [-n <N>] [--] [<path>]\n"
-                 "  show <commit> | show <commit>:<path>\n"
-                 "  cat-object (-p|-t|-s) <hash>\n"
-                 "  diff <commit1> [<commit2>]\n"
-                 "  commit-batch\n"
-                 "  fsck\n"
-                 "  mongo-watch <uri>\n");
+    fputs(
+        "Scribe - content-addressed history for adapter snapshots\n"
+        "\n"
+        "Usage:\n"
+        "  scribe [--store <path>] <command> [args]\n"
+        "  scribe -h | --help\n"
+        "\n"
+        "Global options:\n"
+        "  --store <path>\n"
+        "      Path to the .scribe repository. Defaults to ./.scribe. Most commands\n"
+        "      accept this only before the command; mongo-watch also accepts it after\n"
+        "      the URI for operational scripts.\n"
+        "  -h, --help\n"
+        "      Print this help text.\n"
+        "\n"
+        "Revision syntax:\n"
+        "  Commands that accept commits resolve HEAD, HEAD~N, or a full 64-hex commit\n"
+        "  hash. Object commands require full object hashes unless noted otherwise.\n"
+        "\n"
+        "Commands:\n"
+        "\n",
+        out);
+    fputs(
+        "  init\n"
+        "    Usage:   scribe [--store <path>] init [path]\n"
+        "    Options: none\n"
+        "    Does:    Create a repository skeleton: HEAD, config, log, object\n"
+        "             directories, refs directory, adapter-state directory, and lock\n"
+        "             path. If [path] is omitted, initializes --store or ./.scribe.\n"
+        "\n"
+        "  info\n"
+        "    Usage:   scribe [--store <path>] info\n"
+        "    Options: none\n"
+        "    Does:    Print Scribe version, hash algorithm, pipe protocol, and selected\n"
+        "             repository config. Works even when the store is not initialized.\n"
+        "\n"
+        "  commit-batch\n"
+        "    Usage:   scribe [--store <path>] commit-batch < frame.stream\n"
+        "    Options: none\n"
+        "    Does:    Read pipe protocol v1 BATCH frames from stdin, validate them,\n"
+        "             apply payload/tombstone events to the current tree, write new\n"
+        "             objects, and advance refs/heads/main atomically.\n"
+        "\n",
+        out);
+    fputs(
+        "  list-objects\n"
+        "    Usage:   scribe [--store <path>] list-objects [options]\n"
+        "    Options: --type=blob|tree|commit\n"
+        "                 Filter by object type. May be repeated; repeated types are\n"
+        "                 combined.\n"
+        "             --reachable\n"
+        "                 Print only objects reachable from HEAD through the full\n"
+        "                 parent chain, each commit root tree, and all nested trees.\n"
+        "                 This keeps the reachable set in memory.\n"
+        "             --format=<spec>\n"
+        "                 Output template. Placeholders: %H full hash, %T type,\n"
+        "                 %S uncompressed payload size, %C compressed on-disk size.\n"
+        "                 Default: %H %T %S. %C stats each loose object and is slower.\n"
+        "    Does:    Iterate the object store and print matching objects. Default\n"
+        "             output includes dangling loose objects and is intentionally\n"
+        "             unsorted; pipe to sort when stable ordering is needed.\n"
+        "\n"
+        "  ls-tree\n"
+        "    Usage:   scribe [--store <path>] ls-tree <hash>\n"
+        "    Options: none\n"
+        "    Does:    Recursively list a tree as: <type><tab><hash><tab><path>.\n"
+        "             A commit hash resolves to its root tree. A blob hash fails.\n"
+        "             Entries follow byte-sorted tree storage order.\n"
+        "\n",
+        out);
+    fputs(
+        "  log\n"
+        "    Usage:   scribe [--store <path>] log [--oneline] [--paths] [-n <N>]\n"
+        "             scribe [--store <path>] log [options] [--] <path>\n"
+        "    Options: --oneline\n"
+        "                 Print one compact line per emitted commit.\n"
+        "             --paths\n"
+        "                 Also print changed leaf paths for each emitted commit. In\n"
+        "                 oneline mode this appends [N changed].\n"
+        "             -n <N>\n"
+        "                 Limit the number of commits emitted. With a path filter,\n"
+        "                 Scribe still scans history until N matching commits appear.\n"
+        "             -- <path>\n"
+        "                 End option parsing and treat the next argument as a path.\n"
+        "    Does:    Walk the parent chain from HEAD. With <path>, emit only commits\n"
+        "             where that path's blob or tree hash differs from the parent,\n"
+        "             annotating first appearance as added and disappearance as deleted.\n"
+        "\n"
+        "  show\n"
+        "    Usage:   scribe [--store <path>] show <commit>\n"
+        "             scribe [--store <path>] show <commit>:<path>\n"
+        "    Options: none\n"
+        "    Does:    Without :<path>, print commit metadata, message, and touched\n"
+        "             paths. With :<path>, resolve the path inside the commit root;\n"
+        "             blob paths write raw bytes exactly, tree paths list recursively.\n"
+        "             Quote the argument in the shell when Mongo _id JSON contains\n"
+        "             braces, quotes, or other shell-special characters.\n"
+        "\n",
+        out);
+    fputs(
+        "  cat-object\n"
+        "    Usage:   scribe [--store <path>] cat-object (-p|-t|-s) <hash>\n"
+        "    Options: -p  Print raw object payload bytes.\n"
+        "             -t  Print object type: blob, tree, or commit.\n"
+        "             -s  Print uncompressed payload size.\n"
+        "    Does:    Read one object by full hash, verifying compression, envelope,\n"
+        "             and BLAKE3 hash before printing the requested view.\n"
+        "\n"
+        "  diff\n"
+        "    Usage:   scribe [--store <path>] diff <commit>\n"
+        "             scribe [--store <path>] diff <commit1> <commit2>\n"
+        "    Options: none\n"
+        "    Does:    Compare commit root trees. With one commit, compare its parent to\n"
+        "             it. Output is one changed leaf path per line prefixed by A, M, or D.\n"
+        "\n"
+        "  fsck\n"
+        "    Usage:   scribe [--store <path>] fsck\n"
+        "    Options: none\n"
+        "    Does:    Verify reachable history from refs/heads/main, following parent\n"
+        "             commits and tree edges, checking object envelopes and hashes on\n"
+        "             read. Then scan loose objects and report unvisited ones as dangling.\n"
+        "\n",
+        out);
+    fputs(
+        "  mongo-watch\n"
+        "    Usage:   scribe [--store <path>] mongo-watch <uri>\n"
+        "             scribe mongo-watch <uri> --store <path>\n"
+        "    Options: <uri>\n"
+        "                 MongoDB connection string. Include a database path for\n"
+        "                 database-scoped bootstrap/watch; omit it for cluster scope.\n"
+        "    Does:    Acquire the writer lock, bootstrap current MongoDB document state\n"
+        "             when needed, resume from adapter-state when possible, consume\n"
+        "             change streams, write document commits, print concise commit\n"
+        "             summaries, and persist resume state only after commit success.\n",
+        out);
 }
 
 /*

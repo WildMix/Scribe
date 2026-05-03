@@ -90,7 +90,7 @@ If `libmongoc` and `libbson` are absent, CMake disables `mongo-watch`. Core comm
 Output:
 
 ```text
-scribe version 1.0.2
+scribe version 1.1.0
 hash_algorithm blake3-256
 pipe_protocol 1
 store .scribe (not initialized)
@@ -485,7 +485,7 @@ If the store path does not exist, `info` still prints the binary version, hash a
 Output:
 
 ```text
-scribe version 1.0.2
+scribe version 1.1.0
 hash_algorithm blake3-256
 pipe_protocol 1
 store .scribe (not initialized)
@@ -742,8 +742,11 @@ Event handling in v1:
 - `insert`, `update`, `replace`, `modify`: commit the canonical full document.
 - `delete`: commit a tombstone for the document path.
 - multi-document transactions: one Scribe commit for the transaction.
-- DDL and sharding events: log and ignore.
-- `invalidate`, `drop`, `rename`, `dropDatabase`: restart bootstrap.
+- `create`: log and ignore. An empty MongoDB collection has no representation in the v1 Scribe tree because the tree stores documents, not catalog entries. The first inserted document in the collection creates the `database/collection/document-id` path.
+- `createIndexes`, `dropIndexes`, shard-key, resharding, and other schema/sharding events: log and ignore. v1 does not store MongoDB indexes, validators, collection options, shard metadata, or other catalog metadata.
+- `invalidate`, `drop`, `rename`, `dropDatabase`: restart bootstrap. These events can invalidate the change stream or change/remove an entire database or collection without one reliable per-document delete/move event to replay. Scribe marks the resume token invalid, writes a fresh bootstrap commit parented to existing history, and resumes watching from the replacement token. The bootstrap commit's root tree is the current MongoDB document state, so `scribe diff <old> <new>` shows documents that disappeared or moved even though the DDL operation is not stored as a first-class event in v1.
+
+This means the MongoDB adapter is a document-state recorder, not a full MongoDB audit log. It preserves document history and lets tree diffs reveal the effect of destructive catalog operations, but v1 intentionally does not preserve empty collection creation, index changes, validator changes, or the exact DDL command as a durable object-model event.
 
 ## Operations
 
@@ -945,7 +948,7 @@ Command after appending `unknown_key=true` to `.scribe/config`:
 Output:
 
 ```text
-scribe version 1.0.2
+scribe version 1.1.0
 hash_algorithm blake3-256
 pipe_protocol 1
 scribe: SCRIBE_ECONFIG: unknown config key 'unknown_key'
