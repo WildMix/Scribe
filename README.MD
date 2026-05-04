@@ -103,7 +103,7 @@ Verify the binary:
 Example output:
 
 ```text
-scribe version 1.1.1
+scribe version 1.1.2
 hash_algorithm blake3-256
 pipe_protocol 1
 store .scribe (not initialized)
@@ -212,7 +212,7 @@ Most commands accept `--store <path>` before the command. Commands that read obj
 | `scribe cat-object (-p|-t|-s) <hash>` | Reads one object by full hash and prints the payload, type, or uncompressed payload size. It does not resolve `HEAD` or abbreviated hashes. |
 | `scribe list-objects [opts]` | Iterates the object store. By default it includes all loose objects, including dangling ones. With `--reachable`, it first walks from `HEAD` and prints only objects reachable from main history. |
 | `scribe fsck` | Walks all objects reachable from `refs/heads/main`, verifies every referenced object read, then scans `objects/` for loose objects not visited by that walk and reports them as dangling warnings. |
-| `scribe mongo-watch <uri>` | Acquires the writer lock, bootstraps MongoDB state into a baseline commit when needed, resumes or opens a change stream, converts data events to commits, logs ignored DDL events, persists adapter state only after commit success, and prints concise `commit <short-hash> <operation> <path>` summaries for data commits. |
+| `scribe mongo-watch <uri>` | Acquires the writer lock, bootstraps MongoDB state into a baseline commit when needed, resumes or opens a change stream, converts data events to commits, applies scoped DDL recovery when safe, falls back to full rebootstrap when MongoDB invalidates the token, persists adapter state only after commit success, and prints concise commit summaries. |
 
 `mongo-watch` also accepts the smoke-test form:
 
@@ -238,16 +238,19 @@ mongodb+srv://<credentials>@<cluster>/<database>?authMechanism=MONGODB-AWS&authS
 
 With a database path present, Scribe bootstraps only that database and opens a
 database-scoped change stream. The explicit database path takes precedence over
-the excluded-database list.
+the excluded-database list. In cluster scope, excluded databases are skipped
+during bootstrap and their steady-state change-stream events are ignored.
 
 MongoDB event handling in v1:
 
-- `insert`, `update`, `replace`, and `modify` commit the canonical full document.
+- `insert`, `update`, and `replace` commit the canonical full document.
 - `delete` commits a tombstone for the document path.
 - Multi-document transactions become one Scribe commit.
 - `create` is logged and ignored because an empty collection has no document path in the v1 tree; later inserts into that collection are captured normally.
-- Index, schema, and sharding events are logged and ignored because v1 stores document contents only, not MongoDB catalog metadata.
-- `invalidate`, `drop`, `rename`, and `dropDatabase` trigger a new bootstrap. These events can invalidate the stream or change/remove an entire subtree without one replayable per-document event. The new bootstrap commit records the current MongoDB document state; diffs against the previous commit show the removed or moved documents, but the DDL operation itself is not a first-class commit in v1.
+- `modify` (`collMod`), index, schema, and sharding events are logged and ignored because v1 stores document contents only, not MongoDB catalog metadata.
+- `drop` and resumable `dropDatabase` commit a tombstone for only the affected collection or database subtree. This is O(size of the affected Scribe subtree), not O(cluster size). A database-scoped `dropDatabase` can still be followed by MongoDB `invalidate`; that later event causes full rebootstrap.
+- `rename` commits one DDL recovery commit: delete the old subtree if it is in scope, scan only the renamed target collection if the target database is in scope, and add the target documents. This is O(size of the renamed target collection). If the target database is excluded in cluster scope, Scribe does not scan or track it.
+- `invalidate` and DDL events whose resume token MongoDB refuses trigger a full rebootstrap. A full rebootstrap is O(watch scope): database-scoped URIs rescan that database; cluster-scoped URIs rescan every non-excluded database and stall ingestion while the scan runs.
 
 Adapter state is stored in:
 
@@ -344,7 +347,7 @@ Reviewed all first-party source on `main`:
 - **Core library** (14 files): `src/core/blob.c`, `commit.c`, `config.c`,
   `context.c`, `diff.c`, `fs.c`, `fsck.c`, `inspect.c`, `internal.h`,
   `library.c`, `object.c`, `pipe.c`, `ref.c`, `tree.c`
-- **MongoDB adapter**: `src/adapter_mongo/mongo_bootstrap.c` (2139 lines),
+- **MongoDB adapter**: `src/adapter_mongo/mongo_bootstrap.c` (2619 lines),
   `mongo_json.c` (596 lines), plus headers
 - **Utilities**: `arena.c`, `error.c`, `hex.c`, `leb128.c`, `log.c`, `queue.c`
 - **Build/CI**: `CMakeLists.txt`, `.github/workflows/ci.yml`

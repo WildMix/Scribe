@@ -206,12 +206,40 @@ static void make_temp_store(char *store, size_t store_cap) {
     init_store(store);
 }
 
+static void set_excluded_databases(const char *store, const char *excluded) {
+    char path[PATH_MAX];
+    FILE *f;
+
+    format_checked(path, sizeof(path), "%s/config", store);
+    f = fopen(path, "wb");
+    check(f != NULL, "failed to rewrite %s: %s", path, strerror(errno));
+    fprintf(f,
+            "scribe_format_version = 1\n"
+            "hash_algorithm = blake3-256\n"
+            "compression = zstd\n"
+            "compression_level = 3\n"
+            "worker_threads = 0\n"
+            "event_queue_capacity = 64\n"
+            "queue_stall_warn_seconds = 30\n"
+            "\n"
+            "adapter.name = mongodb\n"
+            "adapter.mongodb.excluded_databases = %s\n"
+            "adapter.mongodb.require_pre_post_images = false\n"
+            "adapter.mongodb.coalesce_window_ms = 0\n",
+            excluded);
+    check(fclose(f) == 0, "failed to close rewritten config");
+}
+
 static void db_name(char *out, size_t cap, const char *suffix) {
     format_checked(out, cap, "scribe_tc_%ld_%s", (long)getpid(), suffix);
 }
 
 static void db_uri(char *out, size_t cap, const char *database) {
     format_checked(out, cap, "mongodb://%s/%s?directConnection=true", g_mongo_hostport, database);
+}
+
+static void cluster_uri(char *out, size_t cap) {
+    format_checked(out, cap, "mongodb://%s/?directConnection=true", g_mongo_hostport);
 }
 
 static void cleanup_container(void) {
@@ -351,6 +379,23 @@ static void insert_user_role(const char *database, const char *id, const char *r
     mongoc_client_destroy(client);
 }
 
+static void insert_string_doc(const char *database, const char *collection_name, const char *id, const char *field,
+                              const char *value) {
+    mongoc_client_t *client = new_client();
+    mongoc_collection_t *collection = mongoc_client_get_collection(client, database, collection_name);
+    bson_t doc;
+    bson_error_t error;
+
+    bson_init(&doc);
+    BSON_APPEND_UTF8(&doc, "_id", id);
+    BSON_APPEND_UTF8(&doc, field, value);
+    check(mongoc_collection_insert_one(collection, &doc, NULL, NULL, &error), "failed to insert %s into %s.%s: %s", id,
+          database, collection_name, error.message);
+    bson_destroy(&doc);
+    mongoc_collection_destroy(collection);
+    mongoc_client_destroy(client);
+}
+
 static void insert_oid_user(const char *database, const char *oid_text) {
     mongoc_client_t *client = new_client();
     mongoc_collection_t *collection = mongoc_client_get_collection(client, database, "users");
@@ -480,6 +525,25 @@ static void drop_users_collection(const char *database) {
     mongoc_client_destroy(client);
 }
 
+static void rename_collection(const char *from_db, const char *from_coll, const char *to_db, const char *to_coll) {
+    mongoc_client_t *client = new_client();
+    bson_t cmd;
+    bson_error_t error;
+    char from_ns[256];
+    char to_ns[256];
+
+    format_checked(from_ns, sizeof(from_ns), "%s.%s", from_db, from_coll);
+    format_checked(to_ns, sizeof(to_ns), "%s.%s", to_db, to_coll);
+    bson_init(&cmd);
+    BSON_APPEND_UTF8(&cmd, "renameCollection", from_ns);
+    BSON_APPEND_UTF8(&cmd, "to", to_ns);
+    BSON_APPEND_BOOL(&cmd, "dropTarget", true);
+    check(mongoc_client_command_simple(client, "admin", &cmd, NULL, NULL, &error), "failed to rename %s to %s: %s",
+          from_ns, to_ns, error.message);
+    bson_destroy(&cmd);
+    mongoc_client_destroy(client);
+}
+
 static void run_transaction_two_writes(const char *database) {
     mongoc_client_t *client = new_client();
     mongoc_collection_t *users = mongoc_client_get_collection(client, database, "users");
@@ -564,6 +628,26 @@ static void wait_for_log(const char *path, const char *needle, int timeout_secon
     fail("timed out waiting for log text '%s'\ncurrent log:\n%s", needle, read_file_alloc(path));
 }
 
+static const char *wait_for_any_log3(const char *path, const char *a, const char *b, const char *c,
+                                     int timeout_seconds) {
+    int i;
+
+    for (i = 0; i < timeout_seconds; i++) {
+        if (file_contains(path, a)) {
+            return a;
+        }
+        if (file_contains(path, b)) {
+            return b;
+        }
+        if (file_contains(path, c)) {
+            return c;
+        }
+        sleep(1u);
+    }
+    fail("timed out waiting for log text '%s', '%s', or '%s'\ncurrent log:\n%s", a, b, c, read_file_alloc(path));
+    return NULL;
+}
+
 static void stop_watcher(watcher_process *watcher) {
     int status;
 
@@ -580,6 +664,11 @@ static void stop_watcher(watcher_process *watcher) {
 static void assert_output_contains(command_result *result, const char *needle, const char *label) {
     check(strstr(result->stdout_bytes, needle) != NULL, "%s missing '%s'\nstdout:\n%s\nstderr:\n%s", label, needle,
           result->stdout_bytes, result->stderr_bytes);
+}
+
+static void assert_output_not_contains(command_result *result, const char *needle, const char *label) {
+    check(strstr(result->stdout_bytes, needle) == NULL, "%s unexpectedly contained '%s'\nstdout:\n%s\nstderr:\n%s",
+          label, needle, result->stdout_bytes, result->stderr_bytes);
 }
 
 static void test_bootstrap_tree_and_canonical_json(void) {
@@ -724,6 +813,8 @@ static void test_ddl_policy_and_bootstrap_recovery(void) {
     db_name(database, sizeof(database), "ddl");
     drop_database(database);
     insert_user_role(database, "alice", "user");
+    insert_string_doc(database, "customers", "acme", "tier", "gold");
+    create_collection(database, "settings");
     enable_pre_images(database, "users");
     db_uri(uri, sizeof(uri), database);
     make_temp_store(store, sizeof(store));
@@ -733,6 +824,8 @@ static void test_ddl_policy_and_bootstrap_recovery(void) {
 
     before = run_scribe(store, "log --oneline");
     assert_success(&before, "log before ignored DDL");
+    enable_pre_images(database, "settings");
+    wait_for_log(watcher.stderr_path, "ignored MongoDB change stream event 'modify'", 60);
     create_index_on_role(database);
     wait_for_log(watcher.stderr_path, "ignored MongoDB change stream event 'createIndexes'", 60);
     sleep(1u);
@@ -744,15 +837,167 @@ static void test_ddl_policy_and_bootstrap_recovery(void) {
     command_result_free(&after);
 
     drop_users_collection(database);
-    wait_for_log(watcher.stderr_path, "change stream resume token is unusable; restarting bootstrap", 60);
-    wait_for_log(watcher.stderr_path, "bootstrap commit", 60);
+    wait_for_log(watcher.stderr_path, "subtree recovery after drop", 60);
     stop_watcher(&watcher);
 
     diff = run_scribe(store, "diff HEAD~1 HEAD");
     assert_success(&diff, "drop recovery diff");
     assert_output_contains(&diff, "D ", "drop recovery diff");
     assert_output_contains(&diff, "users/\"alice\"", "drop recovery diff");
+    assert_output_not_contains(&diff, "customers/\"acme\"", "drop recovery diff");
     command_result_free(&diff);
+
+    after = run_scribe(store, "show 'HEAD:%s/customers/\"acme\"'", database);
+    assert_success(&after, "sibling collection after drop recovery");
+    check(strcmp(after.stdout_bytes, "{\"_id\":\"acme\",\"tier\":\"gold\"}") == 0,
+          "unexpected customer JSON after scoped drop: %s", after.stdout_bytes);
+    command_result_free(&after);
+}
+
+static void test_drop_database_recovery_token_behavior(void) {
+    char database[96];
+    char uri[512];
+    char store[PATH_MAX];
+    watcher_process watcher;
+    command_result result;
+    const char *observed;
+
+    db_name(database, sizeof(database), "dropdb");
+    drop_database(database);
+    insert_user_role(database, "alice", "user");
+    db_uri(uri, sizeof(uri), database);
+    make_temp_store(store, sizeof(store));
+
+    watcher = start_watcher(store, uri);
+    wait_for_log(watcher.stderr_path, "watching MongoDB change stream", 60);
+    drop_database(database);
+    observed = wait_for_any_log3(watcher.stderr_path, "subtree recovery after dropDatabase",
+                                 "full rebootstrap after dropDatabase: DDL resume token unusable",
+                                 "full rebootstrap after invalidate", 60);
+    check(observed != NULL, "dropDatabase recovery did not report token behavior");
+    stop_watcher(&watcher);
+
+    result = run_scribe(store, "show 'HEAD:%s/users/\"alice\"'", database);
+    check(result.exit_code != 0 && strstr(result.stderr_bytes, "SCRIBE_ENOT_FOUND") != NULL,
+          "dropped database document still resolved\nstdout:\n%s\nstderr:\n%s", result.stdout_bytes,
+          result.stderr_bytes);
+    command_result_free(&result);
+}
+
+static void test_rename_recovery_is_single_commit(void) {
+    char database[96];
+    char uri[512];
+    char store[PATH_MAX];
+    watcher_process watcher;
+    command_result result;
+
+    db_name(database, sizeof(database), "rename");
+    drop_database(database);
+    insert_user_role(database, "alice", "user");
+    db_uri(uri, sizeof(uri), database);
+    make_temp_store(store, sizeof(store));
+
+    watcher = start_watcher(store, uri);
+    wait_for_log(watcher.stderr_path, "watching MongoDB change stream", 60);
+    rename_collection(database, "users", database, "archived_users");
+    wait_for_log(watcher.stderr_path, "subtree recovery after rename", 60);
+    stop_watcher(&watcher);
+
+    result = run_scribe(store, "log --oneline -n 1");
+    assert_success(&result, "rename recovery log");
+    assert_output_contains(&result, "mongo ddl recovery", "rename recovery log");
+    command_result_free(&result);
+
+    result = run_scribe(store, "diff HEAD~1 HEAD");
+    assert_success(&result, "rename recovery diff");
+    assert_output_contains(&result, "D ", "rename recovery diff");
+    assert_output_contains(&result, "users/\"alice\"", "rename recovery diff");
+    assert_output_contains(&result, "A ", "rename recovery diff");
+    assert_output_contains(&result, "archived_users/\"alice\"", "rename recovery diff");
+    command_result_free(&result);
+
+    result = run_scribe(store, "show 'HEAD:%s/archived_users/\"alice\"'", database);
+    assert_success(&result, "renamed collection document");
+    check(strcmp(result.stdout_bytes, "{\"_id\":\"alice\",\"role\":\"user\"}") == 0,
+          "unexpected renamed document JSON: %s", result.stdout_bytes);
+    command_result_free(&result);
+}
+
+static void test_rename_racing_insert_is_not_lost(void) {
+    char database[96];
+    char uri[512];
+    char store[PATH_MAX];
+    watcher_process watcher;
+    command_result result;
+
+    db_name(database, sizeof(database), "rename_race");
+    drop_database(database);
+    insert_user_role(database, "alice", "user");
+    db_uri(uri, sizeof(uri), database);
+    make_temp_store(store, sizeof(store));
+
+    watcher = start_watcher(store, uri);
+    wait_for_log(watcher.stderr_path, "watching MongoDB change stream", 60);
+    rename_collection(database, "users", database, "archived_users");
+    insert_string_doc(database, "archived_users", "racer", "role", "late");
+    wait_for_log(watcher.stderr_path, "subtree recovery after rename", 60);
+    wait_for_log(watcher.stderr_path, "archived_users/\"racer\"", 60);
+    stop_watcher(&watcher);
+
+    result = run_scribe(store, "show 'HEAD:%s/archived_users/\"racer\"'", database);
+    assert_success(&result, "racing insert after rename");
+    check(strcmp(result.stdout_bytes, "{\"_id\":\"racer\",\"role\":\"late\"}") == 0,
+          "racing insert after rename was not preserved: %s", result.stdout_bytes);
+    command_result_free(&result);
+}
+
+static void test_rename_respects_excluded_databases(void) {
+    char included[96];
+    char excluded[96];
+    char uri[512];
+    char store[PATH_MAX];
+    char excluded_cfg[384];
+    char reverse_needle[256];
+    watcher_process watcher;
+    command_result result;
+
+    db_name(included, sizeof(included), "included");
+    db_name(excluded, sizeof(excluded), "excluded");
+    drop_database(included);
+    drop_database(excluded);
+    insert_user_role(included, "alice", "user");
+    insert_user_role(excluded, "bob", "user");
+    cluster_uri(uri, sizeof(uri));
+    make_temp_store(store, sizeof(store));
+    format_checked(excluded_cfg, sizeof(excluded_cfg), "admin,local,config,%s", excluded);
+    set_excluded_databases(store, excluded_cfg);
+
+    watcher = start_watcher(store, uri);
+    wait_for_log(watcher.stderr_path, "watching MongoDB change stream", 60);
+
+    rename_collection(included, "users", excluded, "users_from_included");
+    wait_for_log(watcher.stderr_path, "subtree recovery after drop", 60);
+    result = run_scribe(store, "show 'HEAD:%s/users/\"alice\"'", included);
+    check(result.exit_code != 0 && strstr(result.stderr_bytes, "SCRIBE_ENOT_FOUND") != NULL,
+          "included source remained after rename to excluded\nstdout:\n%s\nstderr:\n%s", result.stdout_bytes,
+          result.stderr_bytes);
+    command_result_free(&result);
+    result = run_scribe(store, "show 'HEAD:%s/users_from_included/\"alice\"'", excluded);
+    check(result.exit_code != 0 && strstr(result.stderr_bytes, "SCRIBE_ENOT_FOUND") != NULL,
+          "excluded target was tracked after rename\nstdout:\n%s\nstderr:\n%s", result.stdout_bytes,
+          result.stderr_bytes);
+    command_result_free(&result);
+
+    rename_collection(excluded, "users", included, "users_from_excluded");
+    format_checked(reverse_needle, sizeof(reverse_needle), "-> %s.users_from_excluded", included);
+    wait_for_log(watcher.stderr_path, reverse_needle, 60);
+    stop_watcher(&watcher);
+
+    result = run_scribe(store, "show 'HEAD:%s/users_from_excluded/\"bob\"'", included);
+    assert_success(&result, "rename from excluded to included");
+    check(strcmp(result.stdout_bytes, "{\"_id\":\"bob\",\"role\":\"user\"}") == 0,
+          "unexpected included target JSON after excluded rename: %s", result.stdout_bytes);
+    command_result_free(&result);
 }
 
 int main(int argc, char **argv) {
@@ -767,6 +1012,10 @@ int main(int argc, char **argv) {
     test_change_stream_document_lifecycle();
     test_transaction_becomes_one_commit();
     test_ddl_policy_and_bootstrap_recovery();
+    test_drop_database_recovery_token_behavior();
+    test_rename_recovery_is_single_commit();
+    test_rename_racing_insert_is_not_lost();
+    test_rename_respects_excluded_databases();
     cleanup_container();
     mongoc_cleanup();
     puts("scribe_mongo_testcontainers: passed");

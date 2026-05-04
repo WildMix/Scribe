@@ -150,8 +150,9 @@ static void usage(FILE *out) {
           "                 database-scoped bootstrap/watch; omit it for cluster scope.\n"
           "    Does:    Acquire the writer lock, bootstrap current MongoDB document state\n"
           "             when needed, resume from adapter-state when possible, consume\n"
-          "             change streams, write document commits, print concise commit\n"
-          "             summaries, and persist resume state only after commit success.\n",
+          "             change streams, write document commits, apply scoped DDL recovery\n"
+          "             when safe, fall back to full rebootstrap when MongoDB invalidates\n"
+          "             the token, and persist resume state only after commit success.\n",
           out);
 }
 

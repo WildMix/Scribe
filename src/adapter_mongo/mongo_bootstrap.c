@@ -918,6 +918,19 @@ static long worker_count(scribe_ctx *ctx) {
 }
 
 /*
+ * Adds the majority readConcern documented for bootstrap-style scans. The scan
+ * still uses the saved change-stream token as the replay boundary; majority
+ * reads avoid observing data that has not reached MongoDB's durable majority.
+ */
+static void append_majority_read_concern(bson_t *opts) {
+    bson_t read_concern;
+
+    BSON_APPEND_DOCUMENT_BEGIN(opts, "readConcern", &read_concern);
+    BSON_APPEND_UTF8(&read_concern, "level", "majority");
+    bson_append_document_end(opts, &read_concern);
+}
+
+/*
  * Enumerates every document in one MongoDB collection and pushes copied BSON
  * tasks into the bootstrap queue.
  */
@@ -932,6 +945,7 @@ static scribe_error_t enqueue_collection(mongo_task_queue *queue, mongoc_collect
     bson_init(&query);
     bson_init(&opts);
     BSON_APPEND_INT32(&opts, "batchSize", 1000);
+    append_majority_read_concern(&opts);
     cursor = mongoc_collection_find_with_opts(collection, &query, &opts, NULL);
     bson_destroy(&query);
     bson_destroy(&opts);
@@ -1363,10 +1377,17 @@ static scribe_error_t install_signal_handlers(void) {
 
 typedef struct {
     const char **path;
+    size_t path_len;
     uint8_t *payload;
     size_t payload_len;
-    char operation[8];
+    char operation[16];
 } mongo_watch_change;
+
+typedef enum {
+    MONGO_BATCH_NORMAL = 0,
+    MONGO_BATCH_TRANSACTION = 1,
+    MONGO_BATCH_DDL = 2,
+} mongo_batch_kind;
 
 typedef struct {
     mongo_watch_change *items;
@@ -1375,6 +1396,7 @@ typedef struct {
     char *resume_token;
     char *txn_key;
     int64_t timestamp_unix_nanos;
+    mongo_batch_kind kind;
 } mongo_watch_batch;
 
 /*
@@ -1386,9 +1408,10 @@ static void watch_change_free(mongo_watch_change *change) {
         return;
     }
     if (change->path != NULL) {
-        free((void *)change->path[0]);
-        free((void *)change->path[1]);
-        free((void *)change->path[2]);
+        size_t i;
+        for (i = 0; i < change->path_len; i++) {
+            free((void *)change->path[i]);
+        }
         free(change->path);
     }
     free(change->payload);
@@ -1454,12 +1477,44 @@ static scribe_error_t watch_batch_add(mongo_watch_batch *batch, mongo_watch_chan
     if (batch->count == 0) {
         batch->timestamp_unix_nanos = timestamp_unix_nanos;
     }
-    free(batch->resume_token);
-    batch->resume_token = *resume_token;
-    *resume_token = NULL;
+    if (batch->kind == MONGO_BATCH_NORMAL && batch->txn_key != NULL) {
+        batch->kind = MONGO_BATCH_TRANSACTION;
+    }
+    if (resume_token != NULL && *resume_token != NULL) {
+        free(batch->resume_token);
+        batch->resume_token = *resume_token;
+        *resume_token = NULL;
+    }
     batch->items[batch->count++] = *change;
     memset(change, 0, sizeof(*change));
     return SCRIBE_OK;
+}
+
+/*
+ * Formats a variable-depth Scribe path into a small stack buffer for adapter
+ * logs. Mongo document paths usually have three components, while DDL recovery
+ * tombstones can target database or collection subtrees.
+ */
+static void format_change_path(const mongo_watch_change *change, char *out, size_t out_size) {
+    size_t used = 0;
+    size_t i;
+
+    if (out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    for (i = 0; i < change->path_len; i++) {
+        int n = snprintf(out + used, out_size - used, "%s%s", i == 0 ? "" : "/", change->path[i]);
+        if (n < 0) {
+            out[0] = '\0';
+            return;
+        }
+        if ((size_t)n >= out_size - used) {
+            out[out_size - 1u] = '\0';
+            return;
+        }
+        used += (size_t)n;
+    }
 }
 
 /*
@@ -1473,16 +1528,29 @@ static void watch_batch_log_commit_summary(scribe_ctx *ctx, const char *commit_h
                                            const mongo_watch_batch *watch_batch) {
     size_t i;
 
+    if (watch_batch->kind == MONGO_BATCH_DDL) {
+        scribe_log_plain(ctx, "commit %.7s  ddl recovery %zu event(s)", commit_hex, watch_batch->count);
+        for (i = 0; i < watch_batch->count; i++) {
+            char path[1024];
+            const mongo_watch_change *change = &watch_batch->items[i];
+            format_change_path(change, path, sizeof(path));
+            scribe_log_plain(ctx, "  %s %s", change->operation, path);
+        }
+        return;
+    }
     if (watch_batch->count == 1u) {
+        char path[1024];
         const mongo_watch_change *change = &watch_batch->items[0];
-        scribe_log_plain(ctx, "commit %.7s  %s %s/%s/%s", commit_hex, change->operation, change->path[0],
-                         change->path[1], change->path[2]);
+        format_change_path(change, path, sizeof(path));
+        scribe_log_plain(ctx, "commit %.7s  %s %s", commit_hex, change->operation, path);
         return;
     }
     scribe_log_plain(ctx, "commit %.7s  transaction %zu events", commit_hex, watch_batch->count);
     for (i = 0; i < watch_batch->count; i++) {
+        char path[1024];
         const mongo_watch_change *change = &watch_batch->items[i];
-        scribe_log_plain(ctx, "  %s %s/%s/%s", change->operation, change->path[0], change->path[1], change->path[2]);
+        format_change_path(change, path, sizeof(path));
+        scribe_log_plain(ctx, "  %s %s", change->operation, path);
     }
 }
 
@@ -1514,7 +1582,7 @@ static scribe_error_t watch_batch_commit(scribe_ctx *ctx, mongo_watch_batch *wat
     }
     for (i = 0; i < watch_batch->count; i++) {
         events[i].path = watch_batch->items[i].path;
-        events[i].path_len = 3u;
+        events[i].path_len = watch_batch->items[i].path_len;
         events[i].payload = watch_batch->items[i].payload;
         events[i].payload_len = watch_batch->items[i].payload_len;
     }
@@ -1525,7 +1593,11 @@ static scribe_error_t watch_batch_commit(scribe_ctx *ctx, mongo_watch_batch *wat
     batch.committer = (scribe_identity){"scribe-mongo", "", "scribe"};
     batch.process = (scribe_process_info){"mongo-watch", SCRIBE_VERSION, "", ""};
     batch.timestamp_unix_nanos = watch_batch->timestamp_unix_nanos;
-    batch.message = watch_batch->txn_key == NULL ? "mongo change stream" : "mongo transaction";
+    if (watch_batch->kind == MONGO_BATCH_DDL) {
+        batch.message = "mongo ddl recovery";
+    } else {
+        batch.message = watch_batch->kind == MONGO_BATCH_TRANSACTION ? "mongo transaction" : "mongo change stream";
+    }
     batch.message_len = strlen(batch.message);
     err = scribe_commit_batch(ctx, &batch, commit_hash);
     free(events);
@@ -1557,7 +1629,10 @@ static int token_is_usable(const char *resume_token) {
 static int mongo_resume_error_is_unusable(const char *message) {
     return message != NULL &&
            (strstr(message, "cannot resume stream") != NULL || strstr(message, "resume token was not found") != NULL ||
-            strstr(message, "Resume token was not found") != NULL);
+            strstr(message, "Resume token was not found") != NULL ||
+            strstr(message, "Change stream was invalidated") != NULL ||
+            strstr(message, "change stream was invalidated") != NULL || strstr(message, "NamespaceNotFound") != NULL ||
+            strstr(message, "namespace") != NULL);
 }
 
 /*
@@ -1687,14 +1762,16 @@ static scribe_error_t event_operation(const bson_t *event, const char **out) {
  * Classifies MongoDB operationType values into data events Scribe commits,
  * invalidation events that restart bootstrap, and DDL/schema events that are logged.
  * v1 records document state, not MongoDB catalog metadata, so catalog-only
- * events such as create/createIndexes do not become commits. Destructive DDL is
+ * events such as create/modify/createIndexes do not become commits. MongoDB's
+ * `modify` operationType is collection metadata such as collMod, not a
+ * document update; document updates arrive as `update`. Destructive DDL is
  * different: drop/rename/dropDatabase can invalidate the stream or change a
  * whole subtree without per-document events, so bootstrap is the conservative
  * way to converge Scribe's root tree to MongoDB's current state.
  */
 static mongo_event_kind classify_operation(const char *op) {
     if (strcmp(op, "insert") == 0 || strcmp(op, "update") == 0 || strcmp(op, "replace") == 0 ||
-        strcmp(op, "modify") == 0 || strcmp(op, "delete") == 0) {
+        strcmp(op, "delete") == 0) {
         return MONGO_EVENT_DATA;
     }
     if (strcmp(op, "invalidate") == 0 || strcmp(op, "drop") == 0 || strcmp(op, "dropDatabase") == 0 ||
@@ -1737,6 +1814,95 @@ static scribe_error_t event_namespace(const bson_t *event, char **out_db, char *
         *out_coll = NULL;
         return scribe_set_error(SCRIBE_ENOMEM, "failed to allocate MongoDB namespace");
     }
+    return SCRIBE_OK;
+}
+
+/*
+ * Extracts ns.db from DDL events such as dropDatabase, where ns.coll is absent.
+ */
+static scribe_error_t event_namespace_db(const bson_t *event, char **out_db) {
+    bson_t ns;
+    bson_iter_t iter;
+    uint32_t len;
+    const char *db;
+
+    if (event_document(event, "ns", &ns) != SCRIBE_OK) {
+        return SCRIBE_EADAPTER;
+    }
+    if (!bson_iter_init_find(&iter, &ns, "db") || !BSON_ITER_HOLDS_UTF8(&iter)) {
+        return scribe_set_error(SCRIBE_EADAPTER, "MongoDB change stream event missing ns.db");
+    }
+    db = bson_iter_utf8(&iter, &len);
+    (void)len;
+    *out_db = strdup(db);
+    if (*out_db == NULL) {
+        return scribe_set_error(SCRIBE_ENOMEM, "failed to allocate MongoDB namespace");
+    }
+    return SCRIBE_OK;
+}
+
+/*
+ * Extracts a namespace document with db/coll fields, used for the rename
+ * event's target namespace.
+ */
+static scribe_error_t event_named_namespace(const bson_t *event, const char *field, char **out_db, char **out_coll) {
+    bson_t ns;
+    bson_iter_t iter;
+    uint32_t len;
+    const char *db;
+    const char *coll;
+
+    if (event_document(event, field, &ns) != SCRIBE_OK) {
+        return SCRIBE_EADAPTER;
+    }
+    if (!bson_iter_init_find(&iter, &ns, "db") || !BSON_ITER_HOLDS_UTF8(&iter)) {
+        return scribe_set_error(SCRIBE_EADAPTER, "MongoDB change stream event missing %s.db", field);
+    }
+    db = bson_iter_utf8(&iter, &len);
+    (void)len;
+    if (!bson_iter_init_find(&iter, &ns, "coll") || !BSON_ITER_HOLDS_UTF8(&iter)) {
+        return scribe_set_error(SCRIBE_EADAPTER, "MongoDB change stream event missing %s.coll", field);
+    }
+    coll = bson_iter_utf8(&iter, &len);
+    (void)len;
+    *out_db = strdup(db);
+    *out_coll = strdup(coll);
+    if (*out_db == NULL || *out_coll == NULL) {
+        free(*out_db);
+        free(*out_coll);
+        *out_db = NULL;
+        *out_coll = NULL;
+        return scribe_set_error(SCRIBE_ENOMEM, "failed to allocate MongoDB namespace");
+    }
+    return SCRIBE_OK;
+}
+
+/*
+ * Builds a heap-owned path for a watch change. The generic form is needed by
+ * DDL recovery because dropDatabase targets one component, drop targets two,
+ * and document writes target three.
+ */
+static scribe_error_t change_set_path(mongo_watch_change *change, const char *const *components, size_t count) {
+    const char **path;
+    size_t i;
+
+    path = (const char **)calloc(count == 0 ? 1u : count, sizeof(char *));
+    if (path == NULL) {
+        return scribe_set_error(SCRIBE_ENOMEM, "failed to allocate MongoDB change path");
+    }
+    for (i = 0; i < count; i++) {
+        path[i] = strdup(components[i]);
+        if (path[i] == NULL) {
+            size_t j;
+            for (j = 0; j < i; j++) {
+                free((void *)path[j]);
+            }
+            free(path);
+            return scribe_set_error(SCRIBE_ENOMEM, "failed to allocate MongoDB change path component");
+        }
+    }
+    change->path = path;
+    change->path_len = count;
     return SCRIBE_OK;
 }
 
@@ -1811,6 +1977,7 @@ static scribe_error_t build_watch_change(const bson_t *event, const char *op, mo
     path[1] = coll;
     path[2] = id;
     out->path = path;
+    out->path_len = 3u;
     out->payload = payload;
     out->payload_len = payload_len;
     (void)snprintf(out->operation, sizeof(out->operation), "%s", op);
@@ -1909,9 +2076,12 @@ static scribe_error_t stream_resume_token(mongoc_change_stream_t *stream, const 
  * Non-transactional events commit immediately; transaction events stay batched
  * until the transaction key changes or the stream is flushed.
  */
-static scribe_error_t handle_data_event(scribe_ctx *ctx, mongo_watch_batch *batch, const bson_t *event, const char *op,
-                                        char **resume_token) {
+static int database_is_watched(scribe_ctx *ctx, const mongo_watch_scope *scope, const char *db_name);
+
+static scribe_error_t handle_data_event(scribe_ctx *ctx, const mongo_watch_scope *scope, mongo_watch_batch *batch,
+                                        const bson_t *event, const char *op, char **resume_token) {
     mongo_watch_change change;
+    char *event_db = NULL;
     char *txn_key = NULL;
     int64_t ts = event_cluster_time_unix_nanos(event);
     scribe_error_t err;
@@ -1921,6 +2091,19 @@ static scribe_error_t handle_data_event(scribe_ctx *ctx, mongo_watch_batch *batc
      * transaction stays open until a different transaction key appears, a
      * non-data event forces a flush, shutdown drains it, or the stream ends.
      */
+    err = event_namespace_db(event, &event_db);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    if (!database_is_watched(ctx, scope, event_db)) {
+        scribe_log_msg(ctx, SCRIBE_LOG_INFO, "mongo", "ignored MongoDB change stream event '%s' for excluded %s", op,
+                       event_db);
+        free(event_db);
+        free(*resume_token);
+        *resume_token = NULL;
+        return SCRIBE_OK;
+    }
+    free(event_db);
     memset(&change, 0, sizeof(change));
     err = build_watch_change(event, op, &change);
     if (err != SCRIBE_OK) {
@@ -1953,6 +2136,7 @@ static scribe_error_t handle_data_event(scribe_ctx *ctx, mongo_watch_batch *batc
     if (batch->count == 0) {
         batch->txn_key = txn_key;
         txn_key = NULL;
+        batch->kind = MONGO_BATCH_TRANSACTION;
     }
     err = watch_batch_add(batch, &change, resume_token, ts);
     free(txn_key);
@@ -1963,13 +2147,159 @@ static scribe_error_t handle_data_event(scribe_ctx *ctx, mongo_watch_batch *batc
 }
 
 /*
+ * Refreshes the in-memory resume token from adapter-state after a recovery
+ * commit. This mirrors full-bootstrap recovery, where run_bootstrap writes the
+ * state file and the watch loop reopens from the new durable boundary.
+ */
+static scribe_error_t reload_resume_token_from_state(scribe_ctx *ctx, char **resume_token) {
+    uint8_t last_commit[SCRIBE_HASH_SIZE];
+    char *fresh = NULL;
+    scribe_error_t err = read_adapter_state(ctx, &fresh, last_commit);
+
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    free(*resume_token);
+    *resume_token = fresh;
+    return SCRIBE_OK;
+}
+
+/*
+ * Probes whether MongoDB will accept a DDL event token as a resume boundary.
+ * Some DDL events carry a token but still invalidate the stream namespace; in
+ * those cases scoped recovery would be unsafe because Scribe could not resume
+ * after the scoped commit. The caller falls back to full bootstrap when this
+ * function reports an unusable token.
+ */
+static scribe_error_t probe_resume_token(mongoc_client_t *client, const mongo_watch_scope *scope, const char *token,
+                                         int *usable) {
+    mongoc_change_stream_t *stream = NULL;
+    int token_unusable = 0;
+    scribe_error_t err;
+
+    *usable = 0;
+    err = open_change_stream(client, scope, token, &stream, &token_unusable);
+    if (err == SCRIBE_OK) {
+        mongoc_change_stream_destroy(stream);
+        *usable = 1;
+        return SCRIBE_OK;
+    }
+    (void)token_unusable;
+    return SCRIBE_OK;
+}
+
+/*
+ * Returns whether a database belongs to the current watch scope. Explicit
+ * database-scoped URIs are operator-selected and bypass the excluded list;
+ * cluster-scoped watches apply adapter.mongodb.excluded_databases.
+ */
+static int database_is_watched(scribe_ctx *ctx, const mongo_watch_scope *scope, const char *db_name) {
+    if (scope != NULL && scope->database != NULL) {
+        return strcmp(scope->database, db_name) == 0;
+    }
+    return !is_excluded_db(ctx, db_name);
+}
+
+/*
+ * Adds one tombstone change for a database or collection subtree. The actual
+ * subtree delete happens in Scribe core when the batch is committed.
+ */
+static scribe_error_t add_tombstone_change(mongo_watch_batch *batch, const char *operation,
+                                           const char *const *path_components, size_t path_len, char **resume_token,
+                                           int64_t timestamp_unix_nanos) {
+    mongo_watch_change change;
+    scribe_error_t err;
+
+    memset(&change, 0, sizeof(change));
+    err = change_set_path(&change, path_components, path_len);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    (void)snprintf(change.operation, sizeof(change.operation), "%s", operation);
+    change.payload = NULL;
+    change.payload_len = 0;
+    err = watch_batch_add(batch, &change, resume_token, timestamp_unix_nanos);
+    if (err != SCRIBE_OK) {
+        watch_change_free(&change);
+    }
+    return err;
+}
+
+/*
+ * Scans a single MongoDB collection and appends each current document as an add
+ * event to the provided DDL batch. The batch's resume token is deliberately not
+ * advanced beyond the DDL event token; after the commit Scribe resumes from the
+ * DDL boundary and replays any writes that raced with this scan.
+ */
+static scribe_error_t add_collection_scan_changes(mongo_watch_batch *batch, mongoc_client_t *client,
+                                                  const char *db_name, const char *coll_name, const char *operation,
+                                                  int64_t timestamp_unix_nanos) {
+    mongoc_collection_t *collection = mongoc_client_get_collection(client, db_name, coll_name);
+    bson_t query;
+    bson_t opts;
+    mongoc_cursor_t *cursor;
+    const bson_t *doc;
+    bson_error_t error;
+    scribe_error_t err = SCRIBE_OK;
+
+    if (collection == NULL) {
+        return scribe_set_error(SCRIBE_EADAPTER, "failed to open MongoDB collection %s.%s", db_name, coll_name);
+    }
+    bson_init(&query);
+    bson_init(&opts);
+    BSON_APPEND_INT32(&opts, "batchSize", 1000);
+    append_majority_read_concern(&opts);
+    cursor = mongoc_collection_find_with_opts(collection, &query, &opts, NULL);
+    bson_destroy(&query);
+    bson_destroy(&opts);
+    if (cursor == NULL) {
+        mongoc_collection_destroy(collection);
+        return scribe_set_error(SCRIBE_EADAPTER, "failed to create Mongo cursor");
+    }
+    while (mongoc_cursor_next(cursor, &doc)) {
+        mongo_task task;
+        mongo_result result;
+        mongo_watch_change change;
+        char *unused_resume_token = NULL;
+
+        memset(&task, 0, sizeof(task));
+        memset(&result, 0, sizeof(result));
+        memset(&change, 0, sizeof(change));
+        task.doc = (bson_t *)doc;
+        task.db = (char *)db_name;
+        task.coll = (char *)coll_name;
+        err = process_task(&task, &result);
+        if (err != SCRIBE_OK) {
+            break;
+        }
+        change.path = result.path;
+        change.path_len = 3u;
+        change.payload = result.payload;
+        change.payload_len = result.payload_len;
+        (void)snprintf(change.operation, sizeof(change.operation), "%s", operation);
+        memset(&result, 0, sizeof(result));
+        err = watch_batch_add(batch, &change, &unused_resume_token, timestamp_unix_nanos);
+        if (err != SCRIBE_OK) {
+            watch_change_free(&change);
+            break;
+        }
+    }
+    if (err == SCRIBE_OK && mongoc_cursor_error(cursor, &error)) {
+        err = scribe_set_error(SCRIBE_EADAPTER, "Mongo cursor failed: %s", error.message);
+    }
+    mongoc_cursor_destroy(cursor);
+    mongoc_collection_destroy(collection);
+    return err;
+}
+
+/*
  * Handles invalidation and unusable-token recovery. It flushes any current
  * batch, marks adapter state invalid, writes a new bootstrap commit, and returns
  * the fresh resume token from the new adapter state.
  */
 static scribe_error_t restart_bootstrap_after_invalidate(scribe_ctx *ctx, mongoc_client_t *client,
                                                          const mongo_watch_scope *scope, mongo_watch_batch *batch,
-                                                         char **resume_token) {
+                                                         char **resume_token, const char *reason) {
     scribe_error_t err;
 
     /*
@@ -1986,17 +2316,136 @@ static scribe_error_t restart_bootstrap_after_invalidate(scribe_ctx *ctx, mongoc
     if (err != SCRIBE_OK) {
         return err;
     }
-    scribe_log_msg(ctx, SCRIBE_LOG_WARN, "mongo", "change stream resume token is unusable; restarting bootstrap");
+    scribe_log_msg(ctx, SCRIBE_LOG_WARN, "mongo", "%s", reason);
     err = run_bootstrap(ctx, client, scope);
     if (err != SCRIBE_OK) {
         return err;
     }
-    free(*resume_token);
-    *resume_token = NULL;
-    {
-        uint8_t last_commit[SCRIBE_HASH_SIZE];
-        err = read_adapter_state(ctx, resume_token, last_commit);
+    return reload_resume_token_from_state(ctx, resume_token);
+}
+
+/*
+ * Handles DDL events that can change an entire Mongo subtree. When the DDL
+ * event token is resumable, Scribe commits only the affected subtree change and
+ * persists that token as the durable restart boundary. The current stream can
+ * continue; a later process restart will replay from the DDL event token. If
+ * MongoDB refuses the token, Scribe falls back to full-bootstrap recovery.
+ */
+static scribe_error_t handle_ddl_event(scribe_ctx *ctx, mongoc_client_t *client, const mongo_watch_scope *scope,
+                                       mongo_watch_batch *batch, const bson_t *event, const char *op,
+                                       char **event_token, char **resume_token, int *restart_stream) {
+    mongo_watch_batch ddl_batch;
+    int token_usable = 0;
+    int64_t ts = event_cluster_time_unix_nanos(event);
+    scribe_error_t err;
+
+    *restart_stream = 0;
+    if (strcmp(op, "invalidate") == 0) {
+        free(*event_token);
+        *event_token = NULL;
+        *restart_stream = 1;
+        return restart_bootstrap_after_invalidate(ctx, client, scope, batch, resume_token,
+                                                  "full rebootstrap after invalidate");
     }
+    err = probe_resume_token(client, scope, *event_token, &token_usable);
+    if (err != SCRIBE_OK) {
+        free(*event_token);
+        *event_token = NULL;
+        return err;
+    }
+    if (!token_usable) {
+        char reason[160];
+        (void)snprintf(reason, sizeof(reason), "full rebootstrap after %s: DDL resume token unusable", op);
+        free(*event_token);
+        *event_token = NULL;
+        *restart_stream = 1;
+        return restart_bootstrap_after_invalidate(ctx, client, scope, batch, resume_token, reason);
+    }
+
+    memset(&ddl_batch, 0, sizeof(ddl_batch));
+    ddl_batch.kind = MONGO_BATCH_DDL;
+    ddl_batch.resume_token = *event_token;
+    *event_token = NULL;
+
+    if (strcmp(op, "drop") == 0) {
+        char *db = NULL;
+        char *coll = NULL;
+        const char *path[2];
+
+        err = event_namespace(event, &db, &coll);
+        if (err == SCRIBE_OK && database_is_watched(ctx, scope, db)) {
+            path[0] = db;
+            path[1] = coll;
+            scribe_log_msg(ctx, SCRIBE_LOG_WARN, "mongo", "subtree recovery after drop(%s.%s)", db, coll);
+            err = add_tombstone_change(&ddl_batch, "drop", path, 2u, NULL, ts);
+        } else if (err == SCRIBE_OK) {
+            scribe_log_msg(ctx, SCRIBE_LOG_INFO, "mongo",
+                           "ignored MongoDB change stream event 'drop' for excluded %s.%s", db, coll);
+        }
+        free(db);
+        free(coll);
+    } else if (strcmp(op, "dropDatabase") == 0) {
+        char *db = NULL;
+        const char *path[1];
+
+        err = event_namespace_db(event, &db);
+        if (err == SCRIBE_OK && database_is_watched(ctx, scope, db)) {
+            path[0] = db;
+            scribe_log_msg(ctx, SCRIBE_LOG_WARN, "mongo", "subtree recovery after dropDatabase(%s)", db);
+            err = add_tombstone_change(&ddl_batch, "dropDatabase", path, 1u, NULL, ts);
+        } else if (err == SCRIBE_OK) {
+            scribe_log_msg(ctx, SCRIBE_LOG_INFO, "mongo",
+                           "ignored MongoDB change stream event 'dropDatabase' for excluded %s", db);
+        }
+        free(db);
+    } else if (strcmp(op, "rename") == 0) {
+        char *from_db = NULL;
+        char *from_coll = NULL;
+        char *to_db = NULL;
+        char *to_coll = NULL;
+        int from_watched;
+        int to_watched;
+
+        err = event_namespace(event, &from_db, &from_coll);
+        if (err == SCRIBE_OK) {
+            err = event_named_namespace(event, "to", &to_db, &to_coll);
+        }
+        if (err == SCRIBE_OK) {
+            from_watched = database_is_watched(ctx, scope, from_db);
+            to_watched = database_is_watched(ctx, scope, to_db);
+            if (from_watched || to_watched) {
+                scribe_log_msg(ctx, SCRIBE_LOG_WARN, "mongo", "subtree recovery after rename(%s.%s -> %s.%s)", from_db,
+                               from_coll, to_db, to_coll);
+            } else {
+                scribe_log_msg(ctx, SCRIBE_LOG_INFO, "mongo",
+                               "ignored MongoDB change stream event 'rename' for excluded %s.%s -> %s.%s", from_db,
+                               from_coll, to_db, to_coll);
+            }
+            if (from_watched) {
+                const char *path[2];
+                path[0] = from_db;
+                path[1] = from_coll;
+                err = add_tombstone_change(&ddl_batch, "delete", path, 2u, NULL, ts);
+            }
+            if (err == SCRIBE_OK && to_watched) {
+                err = add_collection_scan_changes(&ddl_batch, client, to_db, to_coll, "add", ts);
+            }
+        }
+        free(from_db);
+        free(from_coll);
+        free(to_db);
+        free(to_coll);
+    } else {
+        err = scribe_set_error(SCRIBE_EADAPTER, "unsupported MongoDB DDL event '%s'", op);
+    }
+
+    if (err == SCRIBE_OK && ddl_batch.count != 0) {
+        err = watch_batch_commit(ctx, &ddl_batch);
+        if (err == SCRIBE_OK) {
+            err = reload_resume_token_from_state(ctx, resume_token);
+        }
+    }
+    watch_batch_clear(&ddl_batch);
     return err;
 }
 
@@ -2024,7 +2473,8 @@ static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client
         err = open_change_stream(client, scope, *resume_token, &stream, &resume_token_unusable);
         if (err != SCRIBE_OK) {
             if (resume_token_unusable) {
-                err = restart_bootstrap_after_invalidate(ctx, client, scope, &batch, resume_token);
+                err = restart_bootstrap_after_invalidate(ctx, client, scope, &batch, resume_token,
+                                                         "full rebootstrap after unusable resume token");
                 watch_batch_clear(&batch);
                 if (err != SCRIBE_OK) {
                     return err;
@@ -2064,11 +2514,10 @@ static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client
                     }
                 }
                 if (kind == MONGO_EVENT_DATA) {
-                    err = handle_data_event(ctx, &batch, event, op, &event_token);
+                    err = handle_data_event(ctx, scope, &batch, event, op, &event_token);
                 } else if (kind == MONGO_EVENT_INVALIDATE) {
-                    free(event_token);
-                    err = restart_bootstrap_after_invalidate(ctx, client, scope, &batch, resume_token);
-                    restart_stream = 1;
+                    err = handle_ddl_event(ctx, client, scope, &batch, event, op, &event_token, resume_token,
+                                           &restart_stream);
                 } else {
                     scribe_log_msg(ctx, SCRIBE_LOG_INFO, "mongo", "ignored MongoDB change stream event '%s'", op);
                     free(event_token);
@@ -2084,7 +2533,8 @@ static scribe_error_t run_change_stream(scribe_ctx *ctx, mongoc_client_t *client
                 if (g_shutdown_requested) {
                     err = watch_batch_commit(ctx, &batch);
                 } else if (token_is_usable(*resume_token) && mongo_resume_error_is_unusable(error.message)) {
-                    err = restart_bootstrap_after_invalidate(ctx, client, scope, &batch, resume_token);
+                    err = restart_bootstrap_after_invalidate(ctx, client, scope, &batch, resume_token,
+                                                             "full rebootstrap after unusable resume token");
                     restart_stream = 1;
                 } else {
                     err = scribe_set_error(SCRIBE_EADAPTER, "MongoDB change stream failed: %s", error.message);

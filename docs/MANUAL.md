@@ -90,7 +90,7 @@ If `libmongoc` and `libbson` are absent, CMake disables `mongo-watch`. Core comm
 Output:
 
 ```text
-scribe version 1.1.1
+scribe version 1.1.2
 hash_algorithm blake3-256
 pipe_protocol 1
 store .scribe (not initialized)
@@ -327,7 +327,7 @@ There is one v1 branch-like ref: `refs/heads/main`. A commit becomes visible onl
 - `event_queue_capacity`: queue capacity used by pipe/library commit flow and Mongo worker coordination.
 - `queue_stall_warn_seconds`: threshold for queue stall warnings.
 - `adapter.name`: must be `mongodb`.
-- `adapter.mongodb.excluded_databases`: comma-separated database names ignored during cluster-scoped bootstrap.
+- `adapter.mongodb.excluded_databases`: comma-separated database names ignored during cluster-scoped bootstrap and steady-state cluster change streams.
 - `adapter.mongodb.require_pre_post_images`: v1 configuration hook for stricter Mongo collection validation.
 - `adapter.mongodb.coalesce_window_ms`: v1 configuration hook for future event coalescing.
 
@@ -485,7 +485,7 @@ If the store path does not exist, `info` still prints the binary version, hash a
 Output:
 
 ```text
-scribe version 1.1.1
+scribe version 1.1.2
 hash_algorithm blake3-256
 pipe_protocol 1
 store .scribe (not initialized)
@@ -731,7 +731,7 @@ Output:
 { ok: 1 }
 ```
 
-By default Scribe excludes `admin`, `local`, and `config`. Change `.scribe/config` key `adapter.mongodb.excluded_databases` to override that list.
+By default Scribe excludes `admin`, `local`, and `config`. Change `.scribe/config` key `adapter.mongodb.excluded_databases` to override that list. In cluster scope, excluded databases are skipped during bootstrap and their steady-state change-stream events are ignored.
 
 An explicit database path takes precedence over the excluded-database list because it is an operator-selected scope.
 
@@ -739,12 +739,15 @@ On startup, `mongo-watch` reads `.scribe/adapter-state/mongodb`. If the token is
 
 Event handling in v1:
 
-- `insert`, `update`, `replace`, `modify`: commit the canonical full document.
+- `insert`, `update`, `replace`: commit the canonical full document.
 - `delete`: commit a tombstone for the document path.
 - multi-document transactions: one Scribe commit for the transaction.
 - `create`: log and ignore. An empty MongoDB collection has no representation in the v1 Scribe tree because the tree stores documents, not catalog entries. The first inserted document in the collection creates the `database/collection/document-id` path.
-- `createIndexes`, `dropIndexes`, shard-key, resharding, and other schema/sharding events: log and ignore. v1 does not store MongoDB indexes, validators, collection options, shard metadata, or other catalog metadata.
-- `invalidate`, `drop`, `rename`, `dropDatabase`: restart bootstrap. These events can invalidate the change stream or change/remove an entire database or collection without one reliable per-document delete/move event to replay. Scribe marks the resume token invalid, writes a fresh bootstrap commit parented to existing history, and resumes watching from the replacement token. The bootstrap commit's root tree is the current MongoDB document state, so `scribe diff <old> <new>` shows documents that disappeared or moved even though the DDL operation is not stored as a first-class event in v1.
+- `modify` (`collMod`), `createIndexes`, `dropIndexes`, shard-key, resharding, and other schema/sharding events: log and ignore. v1 does not store MongoDB indexes, validators, collection options, shard metadata, or other catalog metadata.
+- `drop`: if MongoDB accepts the event resume token, commit one tombstone for `database/collection`. This removes only that collection subtree from Scribe history and does not rescan sibling collections.
+- `dropDatabase`: if MongoDB accepts the event resume token, commit one tombstone for `database`. Some deployments then emit `invalidate` for the database-scoped stream; Scribe handles that later event with full rebootstrap. If the dropDatabase token itself is unusable, Scribe falls back immediately.
+- `rename`: if MongoDB accepts the event resume token, commit one DDL recovery commit. The commit deletes the old collection subtree when the source database is in scope and scans only the renamed target collection when the target database is in scope. For cluster-scoped watches, `rename(included.foo -> excluded.foo)` deletes `included/foo` and does not scan the excluded target; `rename(excluded.foo -> included.foo)` scans and adds only the included target.
+- `invalidate` and DDL events whose resume token cannot be resumed: mark the token invalid and run full rebootstrap. A full rebootstrap is O(watch scope): database-scoped URIs rescan one database, while cluster-scoped URIs rescan every non-excluded database. Ingestion is paused while this scan runs, so avoid cluster-scoped watches on deployments where large drop/rename scripts are common unless that operational cost is acceptable.
 
 This means the MongoDB adapter is a document-state recorder, not a full MongoDB audit log. It preserves document history and lets tree diffs reveal the effect of destructive catalog operations, but v1 intentionally does not preserve empty collection creation, index changes, validator changes, or the exact DDL command as a durable object-model event.
 
@@ -948,7 +951,7 @@ Command after appending `unknown_key=true` to `.scribe/config`:
 Output:
 
 ```text
-scribe version 1.1.1
+scribe version 1.1.2
 hash_algorithm blake3-256
 pipe_protocol 1
 scribe: SCRIBE_ECONFIG: unknown config key 'unknown_key'
@@ -980,7 +983,7 @@ Observed when a saved MongoDB change stream token has fallen out of the server o
 scribe: SCRIBE_EADAPTER: failed to open MongoDB change stream: PlanExecutor error during aggregation :: caused by :: cannot resume stream; the resume token was not found.
 ```
 
-Current code recovers from this automatically: it logs `change stream resume token is unusable; restarting bootstrap`, writes a new bootstrap commit parented to existing history, persists the replacement token, and continues watching. If this error still reaches the CLI, rebuild and confirm the installed `scribe` binary is the updated one.
+Current code recovers from this automatically: it logs `full rebootstrap after unusable resume token`, writes a new bootstrap commit parented to existing history, persists the replacement token, and continues watching. If this error still reaches the CLI, rebuild and confirm the installed `scribe` binary is the updated one.
 
 ### `SCRIBE_ENOMEM`
 
