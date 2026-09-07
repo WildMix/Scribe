@@ -50,9 +50,30 @@ typedef struct {
     const char *correlation_id;
 } scribe_process_info;
 
+/*
+ * Scribe Ingest Batch v1 is the logical write model shared by the C API,
+ * JSON HTTP ingest, and pipe ingest:
+ *
+ *   batch metadata: author, committer, process, timestamp, message
+ *   events[]:       path[], op, optional payload bytes
+ *
+ * op is either put or delete. JSON encodes it with "op": "put" or
+ * "op": "delete". Pipe v2 encodes it with EVENT put/delete. The C API keeps the
+ * compact representation below: a non-NULL payload means put, including an
+ * empty blob when payload_len is zero; a NULL payload means delete.
+ */
+typedef enum {
+    SCRIBE_INGEST_OP_PUT = 1,
+    SCRIBE_INGEST_OP_DELETE = 2,
+} scribe_ingest_op;
+
 typedef struct {
     const char *const *path;
     size_t path_len;
+    /*
+     * NULL payload means tombstone/delete. Non-NULL payload writes a blob,
+     * including when payload_len is zero.
+     */
     const uint8_t *payload;
     size_t payload_len;
 } scribe_change_event;
@@ -75,6 +96,10 @@ scribe_error_t scribe_init_repository(const char *path);
 scribe_error_t scribe_open(const char *path, int writable, scribe_ctx **out);
 void scribe_close(scribe_ctx *ctx);
 
+/*
+ * Returns the resulting commit hash. If the batch leaves the current snapshot
+ * unchanged, this is the existing HEAD hash and no commit or ref is written.
+ */
 scribe_error_t scribe_commit_batch(scribe_ctx *ctx, const scribe_change_batch *batch,
                                    uint8_t out_commit_hash[SCRIBE_HASH_SIZE]);
 

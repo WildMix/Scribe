@@ -21,8 +21,7 @@ Examples:
 The script updates:
   CMakeLists.txt
   include/scribe/scribe.h
-  README.MD
-  docs/MANUAL.md
+  README.md
 
 It commits with:
   Bump Scribe version to <new-version>
@@ -98,8 +97,7 @@ cd "$repo_root"
 version_files=(
     CMakeLists.txt
     include/scribe/scribe.h
-    README.MD
-    docs/MANUAL.md
+    README.md
 )
 
 cmake_version=$(read_cmake_version)
@@ -149,9 +147,14 @@ fi
 
 require_clean_version_files "${version_files[@]}"
 
+if ! git diff --cached --quiet; then
+    echo "Refusing to include unrelated staged changes in the version commit." >&2
+    exit 1
+fi
+
 perl -0pi -e "s/project\\(scribe VERSION \\Q${old_version}\\E LANGUAGES C\\)/project(scribe VERSION ${new_version} LANGUAGES C)/" CMakeLists.txt
 perl -0pi -e "s/#define SCRIBE_VERSION \"\\Q${old_version}\\E\"/#define SCRIBE_VERSION \"${new_version}\"/" include/scribe/scribe.h
-perl -0pi -e "s/scribe version \\Q${old_version}\\E/scribe version ${new_version}/g" README.MD docs/MANUAL.md
+perl -0pi -e "s/scribe version \\Q${old_version}\\E/scribe version ${new_version}/g" README.md
 
 updated_cmake_version=$(read_cmake_version)
 updated_header_version=$(read_header_version)

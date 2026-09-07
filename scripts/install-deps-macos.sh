@@ -8,4 +8,5 @@ fi
 
 brew list cmake >/dev/null 2>&1 || brew install cmake
 brew list pkg-config >/dev/null 2>&1 || brew install pkg-config
-brew list mongo-c-driver >/dev/null 2>&1 || brew install mongo-c-driver
+brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+brew list python >/dev/null 2>&1 || brew install python

@@ -7,12 +7,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 add_compile_definitions(_GNU_SOURCE _POSIX_C_SOURCE=200809L)
 
-option(SCRIBE_BUILD_MONGO_ADAPTER "Build MongoDB adapter" ON)
 option(SCRIBE_BUILD_TESTS "Build tests" ON)
 option(SCRIBE_ENABLE_ASAN "Enable ASan/UBSan" OFF)
 option(SCRIBE_ENABLE_TSAN "Enable TSan" OFF)
-option(SCRIBE_ENABLE_TESTCONTAINERS "Build Docker-backed Testcontainers integration tests" OFF)
-option(SCRIBE_VENDORED_ZSTD "Use vendored zstd" ON)
+option(SCRIBE_ENABLE_SECURE_TRANSPORT "Build TLS and HTTP/2 remote transport support" ON)
 
 if(SCRIBE_ENABLE_ASAN AND SCRIBE_ENABLE_TSAN)
     message(FATAL_ERROR "SCRIBE_ENABLE_ASAN and SCRIBE_ENABLE_TSAN are mutually exclusive")
@@ -72,131 +70,82 @@ set(SCRIBE_UTIL_SOURCES
 
 set(SCRIBE_CORE_SOURCES
     src/core/blob.c
+    src/core/bundle.c
+    src/core/checkpoint.c
     src/core/commit.c
     src/core/config.c
     src/core/context.c
+    src/core/daemon.c
     src/core/diff.c
     src/core/fs.c
     src/core/fsck.c
+    src/core/gc.c
+    src/core/hash_set.c
+    src/core/ingest.c
     src/core/inspect.c
+    src/core/ndjson.c
     src/core/object.c
+    src/core/pack.c
     src/core/pipe.c
     src/core/ref.c
+    src/core/repository.c
+    src/core/sync.c
     src/core/tree.c)
 
-set(SCRIBE_MONGO_SOURCES
-    src/adapter_mongo/mongo_bootstrap.c
-    src/adapter_mongo/mongo_json.c)
-
 add_library(scribe_core STATIC ${SCRIBE_UTIL_SOURCES} ${SCRIBE_CORE_SOURCES})
+set_target_properties(scribe_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(scribe_core
     PUBLIC include
     PRIVATE src vendor/zstd/lib vendor/blake3/c)
 target_link_libraries(scribe_core PUBLIC blake3 libzstd_static PRIVATE scribe_warnings)
 scribe_apply_sanitizers(scribe_core)
 
+if(SCRIBE_ENABLE_SECURE_TRANSPORT)
+    find_package(OpenSSL REQUIRED)
+    target_compile_definitions(scribe_core PRIVATE SCRIBE_HAVE_TLS=1)
+    target_link_libraries(scribe_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
 add_library(scribe SHARED src/core/library.c)
 target_include_directories(scribe PUBLIC include PRIVATE src)
-target_link_libraries(scribe PRIVATE scribe_core scribe_warnings)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_libraries(scribe PRIVATE "-Wl,--whole-archive" scribe_core "-Wl,--no-whole-archive" scribe_warnings)
+else()
+    target_link_libraries(scribe PRIVATE scribe_core scribe_warnings)
+endif()
 set_target_properties(scribe PROPERTIES OUTPUT_NAME scribe)
 scribe_apply_sanitizers(scribe)
 
-add_executable(scribe_cli src/cli/main.c)
-target_include_directories(scribe_cli PRIVATE src)
+add_executable(scribe_cli src/cli/main.c vendor/linenoise/linenoise.c)
+target_include_directories(scribe_cli PRIVATE src vendor/linenoise)
 target_link_libraries(scribe_cli PRIVATE scribe_core scribe_warnings)
 set_target_properties(scribe_cli PROPERTIES OUTPUT_NAME scribe)
 scribe_apply_sanitizers(scribe_cli)
 
-if(SCRIBE_BUILD_MONGO_ADAPTER)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(MONGOC QUIET libmongoc-1.0)
-        pkg_check_modules(BSON QUIET libbson-1.0)
-    endif()
-    if(NOT MONGOC_FOUND OR NOT BSON_FOUND)
-        message(WARNING "libmongoc/libbson not found; mongo-watch is disabled for this build")
-        set(SCRIBE_BUILD_MONGO_ADAPTER OFF CACHE BOOL "" FORCE)
-    else()
-        add_library(scribe_mongo_adapter STATIC ${SCRIBE_MONGO_SOURCES})
-        target_include_directories(scribe_mongo_adapter
-            PUBLIC include
-            PRIVATE src vendor/blake3/c)
-        target_include_directories(scribe_mongo_adapter SYSTEM PRIVATE ${MONGOC_INCLUDE_DIRS} ${BSON_INCLUDE_DIRS})
-        target_compile_options(scribe_mongo_adapter PRIVATE ${MONGOC_CFLAGS_OTHER} ${BSON_CFLAGS_OTHER})
-        target_link_directories(scribe_mongo_adapter PRIVATE ${MONGOC_LIBRARY_DIRS} ${BSON_LIBRARY_DIRS})
-        target_link_libraries(scribe_mongo_adapter
-            PRIVATE scribe_core blake3 ${MONGOC_LIBRARIES} ${BSON_LIBRARIES} scribe_warnings)
-        scribe_apply_sanitizers(scribe_mongo_adapter)
-        target_compile_definitions(scribe_cli PRIVATE SCRIBE_HAVE_MONGO_ADAPTER=1)
-        target_include_directories(scribe_cli SYSTEM PRIVATE ${MONGOC_INCLUDE_DIRS} ${BSON_INCLUDE_DIRS})
-        target_link_directories(scribe_cli PRIVATE ${MONGOC_LIBRARY_DIRS} ${BSON_LIBRARY_DIRS})
-        target_link_libraries(scribe_cli PRIVATE scribe_mongo_adapter ${MONGOC_LIBRARIES} ${BSON_LIBRARIES})
-    endif()
-endif()
+add_executable(scribe_remote_cli
+    src/cli/main.c
+    vendor/linenoise/linenoise.c)
+target_compile_definitions(scribe_remote_cli PRIVATE SCRIBE_CLIENT_ONLY=1)
+target_include_directories(scribe_remote_cli PRIVATE src vendor/linenoise)
+target_link_libraries(scribe_remote_cli PRIVATE scribe_core scribe_warnings)
+set_target_properties(scribe_remote_cli PROPERTIES OUTPUT_NAME scribe-cli)
+scribe_apply_sanitizers(scribe_remote_cli)
 
 if(SCRIBE_BUILD_TESTS)
     enable_testing()
     add_library(unity STATIC vendor/unity/src/unity.c)
     target_include_directories(unity PUBLIC vendor/unity/src)
 
-    add_executable(scribe_tests
-        tests/unit/test_main.c
-        tests/unit/test_core.c)
-    if(SCRIBE_BUILD_MONGO_ADAPTER)
-        target_sources(scribe_tests PRIVATE tests/unit/test_mongo.c)
-        target_compile_definitions(scribe_tests PRIVATE SCRIBE_HAVE_MONGO_ADAPTER=1)
-        target_include_directories(scribe_tests SYSTEM PRIVATE ${MONGOC_INCLUDE_DIRS} ${BSON_INCLUDE_DIRS})
-        target_link_directories(scribe_tests PRIVATE ${MONGOC_LIBRARY_DIRS} ${BSON_LIBRARY_DIRS})
-        target_link_libraries(scribe_tests PRIVATE scribe_mongo_adapter ${MONGOC_LIBRARIES} ${BSON_LIBRARIES})
-    endif()
+    add_executable(scribe_tests tests/unit/test_main.c tests/unit/test_core.c)
     target_include_directories(scribe_tests PRIVATE src)
     target_link_libraries(scribe_tests PRIVATE scribe_core unity scribe_warnings)
     scribe_apply_sanitizers(scribe_tests)
     add_test(NAME scribe_tests COMMAND scribe_tests)
     add_test(NAME scribe_cli_features
-        COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_cli_features.sh" $<TARGET_FILE:scribe_cli>)
-
-    if(SCRIBE_ENABLE_TESTCONTAINERS)
-        if(NOT SCRIBE_BUILD_MONGO_ADAPTER)
-            message(FATAL_ERROR "SCRIBE_ENABLE_TESTCONTAINERS requires SCRIBE_BUILD_MONGO_ADAPTER=ON")
-        endif()
-        if(CMAKE_VERSION VERSION_LESS 3.26)
-            message(FATAL_ERROR "Testcontainers Native requires CMake 3.26 or newer")
-        endif()
-
-        find_program(DOCKER_EXECUTABLE docker REQUIRED)
-
-        include(FetchContent)
-        set(SKIP_DEMOS TRUE CACHE BOOL "" FORCE)
-        FetchContent_Declare(testcontainers_native
-            GIT_REPOSITORY https://github.com/testcontainers/testcontainers-native.git
-            GIT_TAG 2f659b90fedb74a3227a5a4171ef2b6f61195e4c)
-        FetchContent_MakeAvailable(testcontainers_native)
-
-        add_executable(scribe_mongo_integration_tests
-            tests/integration/test_mongo_testcontainers.c)
-        target_include_directories(scribe_mongo_integration_tests
-            PRIVATE src)
-        target_include_directories(scribe_mongo_integration_tests
-            SYSTEM PRIVATE ${MONGOC_INCLUDE_DIRS} ${BSON_INCLUDE_DIRS})
-        target_link_directories(scribe_mongo_integration_tests
-            PRIVATE ${MONGOC_LIBRARY_DIRS} ${BSON_LIBRARY_DIRS})
-        target_link_libraries(scribe_mongo_integration_tests
-            PRIVATE testcontainers-c ${MONGOC_LIBRARIES} ${BSON_LIBRARIES} scribe_warnings)
-        scribe_apply_sanitizers(scribe_mongo_integration_tests)
-
-        add_test(NAME scribe_testcontainers_mongo_image
-            COMMAND ${DOCKER_EXECUTABLE} build -t scribe-mongo-rs-test:7
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/mongo-rs")
-        set_tests_properties(scribe_testcontainers_mongo_image PROPERTIES
-            FIXTURES_SETUP scribe_mongo_image
-            LABELS "integration;mongo;testcontainers")
-
-        add_test(NAME scribe_mongo_testcontainers
-            COMMAND scribe_mongo_integration_tests $<TARGET_FILE:scribe_cli>)
-        set_tests_properties(scribe_mongo_testcontainers PROPERTIES
-            FIXTURES_REQUIRED scribe_mongo_image
-            LABELS "integration;mongo;testcontainers"
-            TIMEOUT 180)
-    endif()
+        COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_cli_features.sh"
+                $<TARGET_FILE:scribe_cli> $<TARGET_FILE:scribe_remote_cli>)
+    set_tests_properties(scribe_cli_features PROPERTIES TIMEOUT 180)
+    add_test(NAME scribe_release_script
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_release.sh"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/push-versioned.sh")
 endif()

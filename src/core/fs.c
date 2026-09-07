@@ -57,10 +57,28 @@ char *scribe_path_join(const char *a, const char *b) {
  * Opens and fsyncs the directory containing path. After an atomic rename, this
  * makes the directory entry update durable instead of only the file contents.
  */
+scribe_error_t scribe_fsync_dir(const char *path) {
+    int fd;
+
+    if (path == NULL || path[0] == '\0') {
+        return scribe_set_error(SCRIBE_EPATH, "empty directory fsync path");
+    }
+    fd = open(path, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        return scribe_set_error(SCRIBE_EIO, "failed to open directory for fsync");
+    }
+    if (fsync(fd) != 0) {
+        close(fd);
+        return scribe_set_error(SCRIBE_EIO, "failed to fsync directory");
+    }
+    close(fd);
+    return SCRIBE_OK;
+}
+
 static scribe_error_t fsync_parent_dir(const char *path) {
     char *copy;
     char *slash;
-    int fd;
+    scribe_error_t err;
 
     copy = strdup(path);
     if (copy == NULL) {
@@ -74,17 +92,9 @@ static scribe_error_t fsync_parent_dir(const char *path) {
     } else {
         *slash = '\0';
     }
-    fd = open(copy, O_RDONLY | O_DIRECTORY);
+    err = scribe_fsync_dir(copy);
     free(copy);
-    if (fd < 0) {
-        return scribe_set_error(SCRIBE_EIO, "failed to open parent directory for fsync");
-    }
-    if (fsync(fd) != 0) {
-        close(fd);
-        return scribe_set_error(SCRIBE_EIO, "failed to fsync parent directory");
-    }
-    close(fd);
-    return SCRIBE_OK;
+    return err;
 }
 
 /*
@@ -129,7 +139,8 @@ scribe_error_t scribe_mkdir_p(const char *path) {
  * logs, adapter state, and loose objects whenever Scribe needs all-or-nothing
  * file replacement.
  */
-scribe_error_t scribe_write_file_atomic(const char *path, const uint8_t *bytes, size_t len) {
+scribe_error_t scribe_write_file_atomic_opts(const char *path, const uint8_t *bytes, size_t len, int sync_file,
+                                             int sync_parent) {
     char tmp[PATH_MAX];
     int fd;
     size_t off = 0;
@@ -153,7 +164,7 @@ scribe_error_t scribe_write_file_atomic(const char *path, const uint8_t *bytes, 
         }
         off += (size_t)n;
     }
-    if (fsync(fd) != 0) {
+    if (sync_file && fsync(fd) != 0) {
         close(fd);
         unlink(tmp);
         return scribe_set_error(SCRIBE_EIO, "failed to fsync temporary file");
@@ -166,7 +177,11 @@ scribe_error_t scribe_write_file_atomic(const char *path, const uint8_t *bytes, 
         unlink(tmp);
         return scribe_set_error(SCRIBE_EIO, "failed to rename temporary file");
     }
-    return fsync_parent_dir(path);
+    return sync_parent ? fsync_parent_dir(path) : SCRIBE_OK;
+}
+
+scribe_error_t scribe_write_file_atomic(const char *path, const uint8_t *bytes, size_t len) {
+    return scribe_write_file_atomic_opts(path, bytes, len, 1, 1);
 }
 
 /*

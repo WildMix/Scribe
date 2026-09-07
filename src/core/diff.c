@@ -11,15 +11,20 @@
 #include "util/error.h"
 #include "util/hex.h"
 
+#include <ctype.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /*
  * Reads a commit object and parses it into an arena-backed view. The arena must
  * outlive the returned view because parsed string fields point into arena memory.
  */
-static scribe_error_t read_commit_view(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE], scribe_arena *arena,
+scribe_error_t scribe_read_commit_view(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE], scribe_arena *arena,
                                        scribe_commit_view *out) {
     scribe_object obj;
     scribe_error_t err = scribe_object_read(ctx, hash, &obj);
@@ -35,9 +40,185 @@ static scribe_error_t read_commit_view(scribe_ctx *ctx, const uint8_t hash[SCRIB
     return err;
 }
 
+void scribe_format_time_utc(int64_t unix_nanos, char *out, size_t out_size) {
+    const int64_t nanos_per_second = 1000000000LL;
+    int64_t seconds = unix_nanos / nanos_per_second;
+    int64_t nanos = unix_nanos % nanos_per_second;
+    time_t t;
+    struct tm tm_utc;
+
+    if (out == NULL || out_size == 0u) {
+        return;
+    }
+    if (nanos < 0) {
+        nanos += nanos_per_second;
+        seconds--;
+    }
+    t = (time_t)seconds;
+    if ((int64_t)t != seconds || gmtime_r(&t, &tm_utc) == NULL) {
+        snprintf(out, out_size, "unknown");
+        return;
+    }
+    if (snprintf(out, out_size, "%04d-%02d-%02dT%02d:%02d:%02d.%09lldZ", tm_utc.tm_year + 1900, tm_utc.tm_mon + 1,
+                 tm_utc.tm_mday, tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec, (long long)nanos) < 0) {
+        snprintf(out, out_size, "unknown");
+    }
+}
+
+static int parse_fixed_digits(const char **p, int count, int *out) {
+    int value = 0;
+    int i;
+
+    for (i = 0; i < count; i++) {
+        unsigned char ch = (unsigned char)(*p)[i];
+
+        if (!isdigit(ch)) {
+            return 0;
+        }
+        value = value * 10 + (int)(ch - '0');
+    }
+    *p += count;
+    *out = value;
+    return 1;
+}
+
+static int consume_char(const char **p, char ch) {
+    if (**p != ch) {
+        return 0;
+    }
+    (*p)++;
+    return 1;
+}
+
+static scribe_error_t parse_numeric_nanos(const char *text, int64_t *out_nanos) {
+    char *end = NULL;
+    intmax_t parsed;
+
+    errno = 0;
+    parsed = strtoimax(text, &end, 10);
+    if (end == text || *end != '\0' || errno == ERANGE || parsed < INT64_MIN || parsed > INT64_MAX) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid timestamp '%s'", text);
+    }
+    *out_nanos = (int64_t)parsed;
+    return SCRIBE_OK;
+}
+
+static scribe_error_t parse_iso_utc_nanos(const char *text, int64_t *out_nanos) {
+    const int64_t nanos_per_second = 1000000000LL;
+    const char *p = text;
+    struct tm tm_utc;
+    struct tm check;
+    int year;
+    int month;
+    int day;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    int requested_year;
+    int requested_month;
+    int requested_day;
+    int requested_hour;
+    int requested_minute;
+    int requested_second;
+    int64_t frac_nanos = 0;
+    int frac_digits = 0;
+    time_t epoch_seconds;
+    int64_t seconds;
+
+    memset(&tm_utc, 0, sizeof(tm_utc));
+    if (!parse_fixed_digits(&p, 4, &year) || !consume_char(&p, '-') || !parse_fixed_digits(&p, 2, &month) ||
+        !consume_char(&p, '-') || !parse_fixed_digits(&p, 2, &day)) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid timestamp '%s'", text);
+    }
+    if (*p == 'T' || *p == 't' || *p == ' ') {
+        p++;
+        if (!parse_fixed_digits(&p, 2, &hour) || !consume_char(&p, ':') || !parse_fixed_digits(&p, 2, &minute) ||
+            !consume_char(&p, ':') || !parse_fixed_digits(&p, 2, &second)) {
+            return scribe_set_error(SCRIBE_EINVAL, "invalid timestamp '%s'", text);
+        }
+        if (*p == '.') {
+            p++;
+            while (isdigit((unsigned char)*p)) {
+                if (frac_digits < 9) {
+                    frac_nanos = frac_nanos * 10 + (int64_t)(*p - '0');
+                } else {
+                    return scribe_set_error(SCRIBE_EINVAL, "timestamp has more than 9 fractional digits '%s'", text);
+                }
+                frac_digits++;
+                p++;
+            }
+            if (frac_digits == 0) {
+                return scribe_set_error(SCRIBE_EINVAL, "invalid timestamp '%s'", text);
+            }
+            while (frac_digits < 9) {
+                frac_nanos *= 10;
+                frac_digits++;
+            }
+        }
+    }
+    if (*p == 'Z' || *p == 'z') {
+        p++;
+    }
+    if (*p != '\0') {
+        return scribe_set_error(SCRIBE_EINVAL, "timestamps must be UTC ISO-8601 or nanoseconds: '%s'", text);
+    }
+    requested_year = year;
+    requested_month = month;
+    requested_day = day;
+    requested_hour = hour;
+    requested_minute = minute;
+    requested_second = second;
+    tm_utc.tm_year = year - 1900;
+    tm_utc.tm_mon = month - 1;
+    tm_utc.tm_mday = day;
+    tm_utc.tm_hour = hour;
+    tm_utc.tm_min = minute;
+    tm_utc.tm_sec = second;
+    tm_utc.tm_isdst = 0;
+    errno = 0;
+    epoch_seconds = timegm(&tm_utc);
+    if (epoch_seconds == (time_t)-1 && errno == EOVERFLOW) {
+        return scribe_set_error(SCRIBE_EINVAL, "timestamp is out of range '%s'", text);
+    }
+    if (gmtime_r(&epoch_seconds, &check) == NULL || check.tm_year + 1900 != requested_year ||
+        check.tm_mon + 1 != requested_month || check.tm_mday != requested_day || check.tm_hour != requested_hour ||
+        check.tm_min != requested_minute || check.tm_sec != requested_second) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid timestamp '%s'", text);
+    }
+    seconds = (int64_t)epoch_seconds;
+    if (seconds > INT64_MAX / nanos_per_second || seconds < INT64_MIN / nanos_per_second) {
+        return scribe_set_error(SCRIBE_EINVAL, "timestamp is out of range '%s'", text);
+    }
+    if (seconds * nanos_per_second > INT64_MAX - frac_nanos) {
+        return scribe_set_error(SCRIBE_EINVAL, "timestamp is out of range '%s'", text);
+    }
+    *out_nanos = seconds * nanos_per_second + frac_nanos;
+    return SCRIBE_OK;
+}
+
+scribe_error_t scribe_parse_time_arg(const char *text, int64_t *out_nanos) {
+    const char *p;
+
+    if (text == NULL || text[0] == '\0' || out_nanos == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "timestamp value is required");
+    }
+    p = text;
+    if (*p == '-' || *p == '+') {
+        p++;
+    }
+    while (*p != '\0' && isdigit((unsigned char)*p)) {
+        p++;
+    }
+    if (*p == '\0' && p != text && !(text[0] == '+' && text[1] == '\0') && !(text[0] == '-' && text[1] == '\0')) {
+        return parse_numeric_nanos(text, out_nanos);
+    }
+    return parse_iso_utc_nanos(text, out_nanos);
+}
+
 /*
  * Resolves the small v1 revision language to a full commit hash. Supported
- * forms are HEAD, HEAD~N, and a full 64-character commit hash.
+ * forms are HEAD, HEAD~N, a full 64-character commit hash, a full ref name, o
+ * a branch/tag shorthand introduced in v2 M4.
  */
 scribe_error_t scribe_resolve_commit(scribe_ctx *ctx, const char *rev, uint8_t out[SCRIBE_HASH_SIZE]) {
     if (rev == NULL || strcmp(rev, "HEAD") == 0) {
@@ -66,7 +247,7 @@ scribe_error_t scribe_resolve_commit(scribe_ctx *ctx, const char *rev, uint8_t o
             if (err != SCRIBE_OK) {
                 return err;
             }
-            err = read_commit_view(ctx, out, &arena, &view);
+            err = scribe_read_commit_view(ctx, out, &arena, &view);
             if (err == SCRIBE_OK) {
                 if (!view.has_parent) {
                     err = scribe_set_error(SCRIBE_ENOT_FOUND, "revision '%s' has no parent", rev);
@@ -81,7 +262,16 @@ scribe_error_t scribe_resolve_commit(scribe_ctx *ctx, const char *rev, uint8_t o
         }
         return SCRIBE_OK;
     }
-    return scribe_hash_from_hex(rev, out);
+    if (strlen(rev) == SCRIBE_HEX_HASH_SIZE) {
+        return scribe_hash_from_hex(rev, out);
+    }
+    {
+        scribe_error_t ref_err = scribe_refs_resolve_name(ctx, rev, out);
+        if (ref_err != SCRIBE_ENOT_FOUND) {
+            return ref_err;
+        }
+    }
+    return scribe_set_error(SCRIBE_ENOT_FOUND, "revision '%s' not found", rev);
 }
 
 typedef scribe_error_t (*diff_visit_fn)(char status, const char *path, void *user);
@@ -89,6 +279,7 @@ typedef scribe_error_t (*diff_visit_fn)(char status, const char *path, void *use
 static scribe_error_t diff_roots(scribe_ctx *ctx, const uint8_t *old_root, const uint8_t new_root[SCRIBE_HASH_SIZE],
                                  diff_visit_fn visit, void *user);
 static scribe_error_t print_diff_visit(char status, const char *path, void *user);
+static const char *type_name(uint8_t type);
 
 typedef struct {
     size_t count;
@@ -160,11 +351,209 @@ static scribe_error_t count_changed_paths(scribe_ctx *ctx, const uint8_t *old_ro
 }
 
 /*
+ * Converts diff status letters into words for path-centric show output. The
+ * existing diff/log commands keep the compact A/M/D form; show <path> is meant
+ * to be read as a small history report, so the longer words are clearer.
+ */
+static const char *change_word(char status) {
+    if (status == 'A') {
+        return "added";
+    }
+    if (status == 'M') {
+        return "modified";
+    }
+    if (status == 'D') {
+        return "deleted";
+    }
+    return "changed";
+}
+
+/*
+ * Returns true when a changed leaf belongs to the requested path. Exact matches
+ * handle blob-level queries; prefix matches handle tree-level queries such as
+ * "db/users", where any changed child document should be reported.
+ */
+static int path_is_under_filter(const char *path, const char *filter) {
+    size_t filter_len = strlen(filter);
+
+    if (filter_len == 0u) {
+        return 0;
+    }
+    if (strcmp(path, filter) == 0) {
+        return 1;
+    }
+    return strncmp(path, filter, filter_len) == 0 && path[filter_len] == '/';
+}
+
+typedef struct {
+    scribe_ctx *ctx;
+    const uint8_t *parent_root;
+    const uint8_t *current_root;
+    const char *filter;
+    const char *commit_hex;
+    int printed_commit;
+    size_t count;
+} show_path_history_state;
+
+/*
+ * Resolves the object hash that should be shown for one changed path. Additions
+ * and modifications point at the current commit's object; deletions point at the
+ * parent object because the path no longer exists in the current tree.
+ */
+static scribe_error_t resolve_changed_object(scribe_ctx *ctx, char status, const uint8_t *parent_root,
+                                             const uint8_t *current_root, const char *path,
+                                             scribe_path_resolution *out) {
+    const uint8_t *root = status == 'D' ? parent_root : current_root;
+    scribe_error_t err;
+
+    if (root == NULL) {
+        return scribe_set_error(SCRIBE_ECORRUPT, "diff path has no root for change resolution");
+    }
+    err = scribe_tree_resolve_path(ctx, root, path, out);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    if (out->state == SCRIBE_PATH_ABSENT) {
+        return scribe_set_error(SCRIBE_ECORRUPT, "diff path could not be resolved");
+    }
+    return SCRIBE_OK;
+}
+
+/*
+ * Visitor used by `scribe show <path>`. It filters leaf diffs to the requested
+ * path/subtree, prints the commit header lazily only when a matching change is
+ * found, and includes the object hash that the path changed to/from.
+ */
+static scribe_error_t show_path_history_visit(char status, const char *path, void *user) {
+    show_path_history_state *state = (show_path_history_state *)user;
+    scribe_path_resolution resolved;
+    char object_hex[SCRIBE_HEX_HASH_SIZE + 1];
+    scribe_error_t err;
+
+    if (!path_is_under_filter(path, state->filter)) {
+        return SCRIBE_OK;
+    }
+    err = resolve_changed_object(state->ctx, status, state->parent_root, state->current_root, path, &resolved);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    scribe_hash_to_hex(resolved.hash, object_hex);
+    if (!state->printed_commit) {
+        printf("commit %s\n", state->commit_hex);
+        state->printed_commit = 1;
+    }
+    printf("  %s %s %s %s\n", change_word(status), type_name((uint8_t)resolved.state), object_hex, path);
+    state->count++;
+    return SCRIBE_OK;
+}
+
+/*
+ * Implements the path-history form of `scribe show <path>`. It walks HEAD's
+ * parent chain newest-to-oldest, diffs each commit against its parent, and
+ * prints only changed blob/tree paths under the requested path.
+ */
+static scribe_error_t scribe_cli_show_history(scribe_ctx *ctx, const char *path) {
+    uint8_t hash[SCRIBE_HASH_SIZE];
+    scribe_error_t err;
+
+    if (path == NULL || path[0] == '\0') {
+        return scribe_set_error(SCRIBE_EINVAL, "show path must not be empty");
+    }
+    err = scribe_refs_read(ctx, "refs/heads/main", hash);
+    if (err == SCRIBE_ENOT_FOUND) {
+        return SCRIBE_OK;
+    }
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    while (1) {
+        scribe_arena arena = {0};
+        scribe_arena parent_arena = {0};
+        scribe_commit_view view;
+        scribe_commit_view parent_view;
+        const uint8_t *parent_root = NULL;
+        uint8_t next_hash[SCRIBE_HASH_SIZE];
+        char commit_hex[SCRIBE_HEX_HASH_SIZE + 1];
+        show_path_history_state state;
+
+        err = scribe_arena_init(&arena, 4096);
+        if (err != SCRIBE_OK) {
+            return err;
+        }
+        err = scribe_read_commit_view(ctx, hash, &arena, &view);
+        if (err != SCRIBE_OK) {
+            scribe_arena_destroy(&arena);
+            return err;
+        }
+        if (view.has_parent) {
+            err = scribe_arena_init(&parent_arena, 4096);
+            if (err == SCRIBE_OK) {
+                err = scribe_read_commit_view(ctx, view.parent, &parent_arena, &parent_view);
+            }
+            if (err != SCRIBE_OK) {
+                scribe_arena_destroy(&parent_arena);
+                scribe_arena_destroy(&arena);
+                return err;
+            }
+            parent_root = parent_view.root_tree;
+            scribe_hash_copy(next_hash, view.parent);
+        }
+        scribe_hash_to_hex(hash, commit_hex);
+        memset(&state, 0, sizeof(state));
+        state.ctx = ctx;
+        state.parent_root = parent_root;
+        state.current_root = view.root_tree;
+        state.filter = path;
+        state.commit_hex = commit_hex;
+        err = diff_roots(ctx, parent_root, view.root_tree, show_path_history_visit, &state);
+        scribe_arena_destroy(&parent_arena);
+        scribe_arena_destroy(&arena);
+        if (err != SCRIBE_OK) {
+            return err;
+        }
+        if (!view.has_parent) {
+            break;
+        }
+        scribe_hash_copy(hash, next_hash);
+    }
+    return SCRIBE_OK;
+}
+
+/*
+ * Identifies arguments that should be treated strictly as revisions. Othe
+ * unresolved show arguments fall through to the path-history form so users can
+ * run `scribe show db/users/alice` without a separate command.
+ */
+static int show_argument_slice_is_revision_syntax(const char *arg, size_t len) {
+    size_t i;
+
+    if ((len == 4u && memcmp(arg, "HEAD", 4u) == 0) || (len >= 5u && memcmp(arg, "HEAD~", 5u) == 0) ||
+        (len > 5u && memcmp(arg, "refs/", 5u) == 0)) {
+        return 1;
+    }
+    if (len != SCRIBE_HEX_HASH_SIZE) {
+        return 0;
+    }
+    for (i = 0; i < len; i++) {
+        if (!((arg[i] >= '0' && arg[i] <= '9') || (arg[i] >= 'a' && arg[i] <= 'f') ||
+              (arg[i] >= 'A' && arg[i] <= 'F'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int show_argument_is_revision_syntax(const char *arg) {
+    return show_argument_slice_is_revision_syntax(arg, strlen(arg));
+}
+
+/*
  * Implements `scribe log`. It walks the parent chain from HEAD, optionally
  * filters commits by one path, optionally prints changed paths, and applies -n
  * to the number of commits emitted rather than the number scanned.
  */
-scribe_error_t scribe_cli_log(scribe_ctx *ctx, int oneline, size_t limit, int show_paths, const char *path_filter) {
+scribe_error_t scribe_cli_log(scribe_ctx *ctx, int oneline, size_t limit, int show_paths, const char *path_filter,
+                              const scribe_time_range *time_range) {
     uint8_t hash[SCRIBE_HASH_SIZE];
     size_t emitted = 0;
     scribe_error_t err = scribe_refs_read(ctx, "refs/heads/main", hash);
@@ -192,7 +581,7 @@ scribe_error_t scribe_cli_log(scribe_ctx *ctx, int oneline, size_t limit, int sh
         if (err != SCRIBE_OK) {
             return err;
         }
-        err = read_commit_view(ctx, hash, &arena, &view);
+        err = scribe_read_commit_view(ctx, hash, &arena, &view);
         if (err != SCRIBE_OK) {
             scribe_arena_destroy(&arena);
             return err;
@@ -200,7 +589,7 @@ scribe_error_t scribe_cli_log(scribe_ctx *ctx, int oneline, size_t limit, int sh
         if (view.has_parent) {
             err = scribe_arena_init(&parent_arena, 4096);
             if (err == SCRIBE_OK) {
-                err = read_commit_view(ctx, view.parent, &parent_arena, &parent_view);
+                err = scribe_read_commit_view(ctx, view.parent, &parent_arena, &parent_view);
             }
             if (err != SCRIBE_OK) {
                 scribe_arena_destroy(&parent_arena);
@@ -234,6 +623,14 @@ scribe_error_t scribe_cli_log(scribe_ctx *ctx, int oneline, size_t limit, int sh
             emit = path_resolution_changed(&parent_path, &current_path);
             annotation = path_change_annotation(&parent_path, &current_path);
         }
+        if (emit && time_range != NULL) {
+            if (time_range->has_since && view.committer_time < time_range->since_nanos) {
+                emit = 0;
+            }
+            if (time_range->has_until && view.committer_time > time_range->until_nanos) {
+                emit = 0;
+            }
+        }
         if (emit && show_paths && oneline) {
             err = count_changed_paths(ctx, parent_root, view.root_tree, &changed_count);
             if (err != SCRIBE_OK) {
@@ -264,8 +661,14 @@ scribe_error_t scribe_cli_log(scribe_ctx *ctx, int oneline, size_t limit, int sh
                     printf("parent %s\n", parent_hex);
                 }
                 printf("author %s <%s> %lld\n", view.author_name, view.author_email, (long long)view.author_time);
-                printf("committer %s <%s> %lld\n\n", view.committer_name, view.committer_email,
+                printf("committer %s <%s> %lld\n", view.committer_name, view.committer_email,
                        (long long)view.committer_time);
+                {
+                    char committed_at[64];
+
+                    scribe_format_time_utc(view.committer_time, committed_at, sizeof(committed_at));
+                    printf("committed_at %s\n\n", committed_at);
+                }
                 if (view.message_len != 0) {
                     printf("%.*s\n", (int)view.message_len, (const char *)view.message);
                 }
@@ -316,17 +719,39 @@ scribe_error_t scribe_cli_show(scribe_ctx *ctx, const char *rev) {
     scribe_error_t err;
 
     if (strchr(rev, ':') != NULL) {
-        return scribe_cli_show_path(ctx, rev);
+        const char *colon = strchr(rev, ':');
+        size_t prefix_len = (size_t)(colon - rev);
+        char *prefix = (char *)malloc(prefix_len + 1u);
+
+        if (prefix == NULL) {
+            return scribe_set_error(SCRIBE_ENOMEM, "failed to allocate show revision prefix");
+        }
+        memcpy(prefix, rev, prefix_len);
+        prefix[prefix_len] = '\0';
+        err = scribe_resolve_commit(ctx, prefix, hash);
+        if (err == SCRIBE_OK) {
+            free(prefix);
+            return scribe_cli_show_path(ctx, rev);
+        }
+        if (show_argument_slice_is_revision_syntax(prefix, prefix_len)) {
+            free(prefix);
+            return err;
+        }
+        free(prefix);
+        return scribe_cli_show_history(ctx, rev);
     }
     err = scribe_resolve_commit(ctx, rev, hash);
     if (err != SCRIBE_OK) {
-        return err;
+        if (show_argument_is_revision_syntax(rev)) {
+            return err;
+        }
+        return scribe_cli_show_history(ctx, rev);
     }
     err = scribe_arena_init(&arena, 4096);
     if (err != SCRIBE_OK) {
         return err;
     }
-    err = read_commit_view(ctx, hash, &arena, &view);
+    err = scribe_read_commit_view(ctx, hash, &arena, &view);
     if (err != SCRIBE_OK) {
         scribe_arena_destroy(&arena);
         return err;
@@ -340,6 +765,12 @@ scribe_error_t scribe_cli_show(scribe_ctx *ctx, const char *rev) {
     }
     printf("author %s <%s> %lld\n", view.author_name, view.author_email, (long long)view.author_time);
     printf("committer %s <%s> %lld\n", view.committer_name, view.committer_email, (long long)view.committer_time);
+    {
+        char committed_at[64];
+
+        scribe_format_time_utc(view.committer_time, committed_at, sizeof(committed_at));
+        printf("committed_at %s\n", committed_at);
+    }
     printf("process %s %s %s %s\n\n", view.process_name, view.process_version, view.process_params,
            view.process_correlation_id);
     if (view.message_len != 0) {
@@ -405,15 +836,21 @@ static scribe_error_t pretty_tree(scribe_object *obj) {
 }
 
 /*
- * Implements `scribe cat-object`. The object is read and verified before the
- * requested mode prints its type, payload size, or pretty/raw payload contents.
+ * Implements `scribe-cli cat-object`. Full object hashes are read directly.
+ * Revision placeholders such as HEAD and HEAD~N resolve to commit objects so
+ * the command line accepts the same commit placeholders everywhere a commit
+ * hash would work.
  */
-scribe_error_t scribe_cli_cat_object(scribe_ctx *ctx, char mode, const char *hex) {
+scribe_error_t scribe_cli_cat_object(scribe_ctx *ctx, char mode, const char *spec) {
     uint8_t hash[SCRIBE_HASH_SIZE];
     scribe_object obj;
-    scribe_error_t err = scribe_hash_from_hex(hex, hash);
+    scribe_error_t err = scribe_hash_from_hex(spec, hash);
+
     if (err != SCRIBE_OK) {
-        return err;
+        err = scribe_resolve_commit(ctx, spec, hash);
+        if (err != SCRIBE_OK) {
+            return err;
+        }
     }
     err = scribe_object_read(ctx, hash, &obj);
     if (err != SCRIBE_OK) {
@@ -426,9 +863,13 @@ scribe_error_t scribe_cli_cat_object(scribe_ctx *ctx, char mode, const char *hex
     } else if (mode == 'p') {
         if (obj.type == SCRIBE_OBJECT_TREE) {
             err = pretty_tree(&obj);
+        } else if (obj.type == SCRIBE_OBJECT_BLOB) {
+            if (obj.payload_len != 0u && fwrite(obj.payload, 1, obj.payload_len, stdout) != obj.payload_len) {
+                err = scribe_set_error(SCRIBE_EIO, "failed to write blob payload");
+            }
         } else {
             fwrite(obj.payload, 1, obj.payload_len, stdout);
-            if (obj.type != SCRIBE_OBJECT_BLOB || obj.payload_len == 0 || obj.payload[obj.payload_len - 1u] != '\n') {
+            if (obj.payload_len == 0u || obj.payload[obj.payload_len - 1u] != '\n') {
                 printf("\n");
             }
         }
@@ -698,7 +1139,7 @@ scribe_error_t scribe_cli_diff(scribe_ctx *ctx, const char *a_rev, const char *b
         if (err != SCRIBE_OK) {
             return err;
         }
-        err = read_commit_view(ctx, b_hash, &arena_b, &b_commit);
+        err = scribe_read_commit_view(ctx, b_hash, &arena_b, &b_commit);
         if (err != SCRIBE_OK) {
             scribe_arena_destroy(&arena_b);
             return err;
@@ -721,9 +1162,9 @@ scribe_error_t scribe_cli_diff(scribe_ctx *ctx, const char *a_rev, const char *b
         scribe_arena_destroy(&arena_b);
         return err;
     }
-    err = read_commit_view(ctx, a_hash, &arena_a, &a_commit);
+    err = scribe_read_commit_view(ctx, a_hash, &arena_a, &a_commit);
     if (err == SCRIBE_OK) {
-        err = read_commit_view(ctx, b_hash, &arena_b, &b_commit);
+        err = scribe_read_commit_view(ctx, b_hash, &arena_b, &b_commit);
     }
     if (err == SCRIBE_OK) {
         err = diff_trees(ctx, a_commit.root_tree, b_commit.root_tree, "", print_diff_visit, "");

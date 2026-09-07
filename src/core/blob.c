@@ -31,6 +31,95 @@ struct tree_node {
     size_t cap;
 };
 
+typedef struct {
+    scribe_ctx *ctx;
+    scribe_pack_writer *pack;
+    int use_pack;
+    scribe_loose_fsync_mode loose_fsync;
+    bool touched_fanouts[256];
+} commit_object_writer;
+
+static size_t batch_payload_bytes(const scribe_change_batch *batch) {
+    size_t total = 0;
+    size_t i;
+
+    if (batch == NULL) {
+        return 0;
+    }
+    for (i = 0; i < batch->event_count; i++) {
+        if (batch->events[i].payload_len > SIZE_MAX - total) {
+            return SIZE_MAX;
+        }
+        total += batch->events[i].payload_len;
+    }
+    return total;
+}
+
+static int commit_batch_should_pack(scribe_ctx *ctx, const scribe_change_batch *batch) {
+    size_t payload_bytes;
+
+    if (ctx->config.commit_storage == SCRIBE_COMMIT_STORAGE_PACK) {
+        return 1;
+    }
+    if (ctx->config.commit_storage == SCRIBE_COMMIT_STORAGE_LOOSE || batch == NULL) {
+        return 0;
+    }
+    payload_bytes = batch_payload_bytes(batch);
+    if (ctx->config.commit_pack_event_threshold != 0u &&
+        batch->event_count >= ctx->config.commit_pack_event_threshold) {
+        return 1;
+    }
+    return ctx->config.commit_pack_payload_threshold != 0u &&
+           payload_bytes >= ctx->config.commit_pack_payload_threshold;
+}
+
+static scribe_error_t commit_object_writer_begin(commit_object_writer *writer, scribe_ctx *ctx,
+                                                 const scribe_change_batch *batch) {
+    memset(writer, 0, sizeof(*writer));
+    writer->ctx = ctx;
+    writer->loose_fsync = ctx->config.commit_loose_fsync;
+    writer->use_pack = commit_batch_should_pack(ctx, batch);
+    if (!writer->use_pack) {
+        return SCRIBE_OK;
+    }
+    return scribe_pack_writer_begin(ctx, &writer->pack);
+}
+
+static scribe_error_t commit_object_writer_write(commit_object_writer *writer, uint8_t type, const uint8_t *payload,
+                                                 size_t payload_len, uint8_t out_hash[SCRIBE_HASH_SIZE]) {
+    uint8_t fanout = 0;
+    int written = 0;
+    scribe_error_t err;
+
+    if (writer->use_pack) {
+        return scribe_pack_writer_add(writer->pack, type, payload, payload_len, out_hash);
+    }
+    if (writer->loose_fsync == SCRIBE_LOOSE_FSYNC_PER_OBJECT) {
+        return scribe_object_write(writer->ctx, type, payload, payload_len, out_hash);
+    }
+    err = scribe_object_write_loose_opts(writer->ctx, type, payload, payload_len, 0, 0, out_hash, &fanout, &written);
+    if (err == SCRIBE_OK && written && writer->loose_fsync == SCRIBE_LOOSE_FSYNC_COMMIT) {
+        writer->touched_fanouts[fanout] = true;
+    }
+    return err;
+}
+
+static scribe_error_t commit_object_writer_finish(commit_object_writer *writer) {
+    if (writer->use_pack) {
+        return scribe_pack_writer_finish(&writer->pack, NULL);
+    }
+    if (writer->loose_fsync == SCRIBE_LOOSE_FSYNC_COMMIT) {
+        return scribe_object_fsync_fanout_dirs(writer->ctx, writer->touched_fanouts);
+    }
+    return SCRIBE_OK;
+}
+
+static void commit_object_writer_abort(commit_object_writer *writer) {
+    if (writer != NULL && writer->pack != NULL) {
+        scribe_pack_writer_abort(&writer->pack);
+    }
+}
+
 /*
  * Allocates an empty mutable tree node from the work arena. All nodes created
  * during one commit are freed together when that arena is destroyed.
@@ -347,7 +436,7 @@ static scribe_error_t estimate_tree_work_capacity(scribe_ctx *ctx, const uint8_t
  * blob objects and installed at the leaf path; NULL payloads delete the leaf as
  * a tombstone.
  */
-static scribe_error_t apply_change(scribe_ctx *ctx, scribe_arena *work, tree_node *root,
+static scribe_error_t apply_change(commit_object_writer *writer, scribe_arena *work, tree_node *root,
                                    const scribe_change_event *ev) {
     tree_node *node = root;
     size_t i;
@@ -383,7 +472,8 @@ static scribe_error_t apply_change(scribe_ctx *ctx, scribe_arena *work, tree_nod
     }
     {
         uint8_t blob_hash[SCRIBE_HASH_SIZE];
-        scribe_error_t err = scribe_object_write(ctx, SCRIBE_OBJECT_BLOB, ev->payload, ev->payload_len, blob_hash);
+        scribe_error_t err =
+            commit_object_writer_write(writer, SCRIBE_OBJECT_BLOB, ev->payload, ev->payload_len, blob_hash);
         if (err != SCRIBE_OK) {
             return err;
         }
@@ -395,7 +485,8 @@ static scribe_error_t apply_change(scribe_ctx *ctx, scribe_arena *work, tree_nod
  * Serializes a mutable tree and all of its child trees into immutable tree
  * objects. Children are written first because parent entries need child hashes.
  */
-static scribe_error_t write_tree_recursive(scribe_ctx *ctx, tree_node *node, uint8_t out_hash[SCRIBE_HASH_SIZE]) {
+static scribe_error_t write_tree_recursive(commit_object_writer *writer, tree_node *node,
+                                           uint8_t out_hash[SCRIBE_HASH_SIZE]) {
     scribe_tree_entry *entries;
     scribe_arena arena;
     uint8_t *payload;
@@ -406,7 +497,7 @@ static scribe_error_t write_tree_recursive(scribe_ctx *ctx, tree_node *node, uin
 
     /*
      * After all events are applied, the mutable tree is collapsed back into
-     * immutable tree objects bottom-up. Child trees are written first so their
+     * immutable tree objects bottom-up. Child trees are written first so thei
      * hashes can be placed in the parent tree entry array. Unchanged subtrees
      * naturally reuse their existing hash because tree serialization is
      * canonical and object writes are content-addressed.
@@ -430,7 +521,7 @@ static scribe_error_t write_tree_recursive(scribe_ctx *ctx, tree_node *node, uin
         entries[i].name = node->entries[i].name;
         entries[i].name_len = strlen(node->entries[i].name);
         if (node->entries[i].type == SCRIBE_OBJECT_TREE) {
-            err = write_tree_recursive(ctx, node->entries[i].child, entries[i].hash);
+            err = write_tree_recursive(writer, node->entries[i].child, entries[i].hash);
             if (err != SCRIBE_OK) {
                 scribe_arena_destroy(&arena);
                 return err;
@@ -444,26 +535,26 @@ static scribe_error_t write_tree_recursive(scribe_ctx *ctx, tree_node *node, uin
         scribe_arena_destroy(&arena);
         return err;
     }
-    err = scribe_object_write(ctx, SCRIBE_OBJECT_TREE, payload, payload_len, out_hash);
+    err = commit_object_writer_write(writer, SCRIBE_OBJECT_TREE, payload, payload_len, out_hash);
     scribe_arena_destroy(&arena);
     return err;
 }
 
 /*
  * Reads refs/heads/main and extracts the root tree hash from the current commit.
- * If the repository has no main ref yet, has_parent is false and the caller
+ * If the repository has no main ref yet, has_parent is false and the calle
  * should start from a new empty root tree.
  */
-static scribe_error_t read_head_root_hash(scribe_ctx *ctx, uint8_t parent_hash[SCRIBE_HASH_SIZE], int *has_parent,
-                                          uint8_t root_hash[SCRIBE_HASH_SIZE]) {
+static scribe_error_t read_ref_root_hash(scribe_ctx *ctx, const char *ref, uint8_t parent_hash[SCRIBE_HASH_SIZE],
+                                         int *has_parent, uint8_t root_hash[SCRIBE_HASH_SIZE]) {
     scribe_error_t err;
 
     /*
      * The current root tree is not stored separately from commits. To append a
-     * normal change batch, read refs/heads/main, parse the commit it points to,
+     * normal change batch, read the target ref, parse the commit it points to,
      * and take that commit's root tree as the editable base.
      */
-    err = scribe_refs_read(ctx, "refs/heads/main", parent_hash);
+    err = scribe_refs_read(ctx, ref, parent_hash);
     if (err == SCRIBE_ENOT_FOUND) {
         *has_parent = 0;
         memset(root_hash, 0, SCRIBE_HASH_SIZE);
@@ -483,7 +574,7 @@ static scribe_error_t read_head_root_hash(scribe_ctx *ctx, uint8_t parent_hash[S
         }
         if (commit_obj.type != SCRIBE_OBJECT_COMMIT) {
             scribe_object_free(&commit_obj);
-            return scribe_set_error(SCRIBE_ECORRUPT, "main ref does not point to a commit");
+            return scribe_set_error(SCRIBE_ECORRUPT, "ref '%s' does not point to a commit", ref);
         }
         err = scribe_arena_init(&arena, commit_obj.payload_len + 1024u);
         if (err != SCRIBE_OK) {
@@ -498,6 +589,11 @@ static scribe_error_t read_head_root_hash(scribe_ctx *ctx, uint8_t parent_hash[S
         scribe_object_free(&commit_obj);
         return err;
     }
+}
+
+static scribe_error_t read_head_root_hash(scribe_ctx *ctx, uint8_t parent_hash[SCRIBE_HASH_SIZE], int *has_parent,
+                                          uint8_t root_hash[SCRIBE_HASH_SIZE]) {
+    return read_ref_root_hash(ctx, "refs/heads/main", parent_hash, has_parent, root_hash);
 }
 
 /*
@@ -515,6 +611,7 @@ scribe_error_t scribe_commit_batch_internal(scribe_ctx *ctx, const scribe_change
     size_t commit_payload_len;
     scribe_arena arena;
     scribe_arena work;
+    commit_object_writer writer;
     int has_parent = 0;
     size_t i;
     size_t work_capacity;
@@ -551,46 +648,196 @@ scribe_error_t scribe_commit_batch_internal(scribe_ctx *ctx, const scribe_change
     if (err != SCRIBE_OK) {
         return err;
     }
+    err = commit_object_writer_begin(&writer, ctx, batch);
+    if (err != SCRIBE_OK) {
+        scribe_arena_destroy(&work);
+        return err;
+    }
     if (has_parent) {
         err = load_tree(ctx, &work, parent_root_hash, &root);
         if (err != SCRIBE_OK) {
+            commit_object_writer_abort(&writer);
             scribe_arena_destroy(&work);
             return err;
         }
     } else {
         root = node_new(&work);
         if (root == NULL) {
+            commit_object_writer_abort(&writer);
             scribe_arena_destroy(&work);
             return SCRIBE_ENOMEM;
         }
     }
     for (i = 0; i < batch->event_count; i++) {
-        err = apply_change(ctx, &work, root, &batch->events[i]);
+        err = apply_change(&writer, &work, root, &batch->events[i]);
         if (err != SCRIBE_OK) {
+            commit_object_writer_abort(&writer);
             scribe_arena_destroy(&work);
             return err;
         }
     }
-    err = write_tree_recursive(ctx, root, root_hash);
+    err = write_tree_recursive(&writer, root, root_hash);
     if (err != SCRIBE_OK) {
+        commit_object_writer_abort(&writer);
         scribe_arena_destroy(&work);
         return err;
     }
     err = scribe_arena_init(&arena, 4096u + (batch->message_len * 2u));
     if (err != SCRIBE_OK) {
+        commit_object_writer_abort(&writer);
+        scribe_arena_destroy(&work);
         return err;
     }
     err = scribe_commit_serialize(root_hash, has_parent ? parent_hash : NULL, batch, &arena, &commit_payload,
                                   &commit_payload_len);
+    if (err == SCRIBE_OK && has_parent && scribe_hash_cmp(root_hash, parent_root_hash) == 0) {
+        /*
+         * The snapshot already has this exact content. Return the commit that
+         * owns it without publishing another commit, ref update, or pending pack.
+         */
+        scribe_arena_destroy(&arena);
+        commit_object_writer_abort(&writer);
+        scribe_arena_destroy(&work);
+        scribe_hash_copy(out_commit_hash, parent_hash);
+        scribe_log_msg(ctx, SCRIBE_LOG_DEBUG, "commit", "skipped unchanged batch");
+        scribe_log_flush(ctx);
+        return SCRIBE_OK;
+    }
     if (err == SCRIBE_OK) {
-        err = scribe_object_write(ctx, SCRIBE_OBJECT_COMMIT, commit_payload, commit_payload_len, out_commit_hash);
+        err = commit_object_writer_write(&writer, SCRIBE_OBJECT_COMMIT, commit_payload, commit_payload_len,
+                                         out_commit_hash);
+    }
+    if (err == SCRIBE_OK) {
+        err = commit_object_writer_finish(&writer);
     }
     scribe_arena_destroy(&arena);
     scribe_arena_destroy(&work);
     if (err != SCRIBE_OK) {
+        commit_object_writer_abort(&writer);
         return err;
     }
     err = scribe_refs_cas(ctx, "refs/heads/main", has_parent ? parent_hash : NULL, out_commit_hash);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    scribe_log_msg(ctx, SCRIBE_LOG_DEBUG, "commit", "wrote commit");
+    scribe_log_flush(ctx);
+    return SCRIBE_OK;
+}
+
+scribe_error_t scribe_commit_batch_to_ref_internal(scribe_ctx *ctx, const char *ref, const char *reason,
+                                                   const scribe_change_batch *batch,
+                                                   uint8_t out_commit_hash[SCRIBE_HASH_SIZE]) {
+    tree_node *root = NULL;
+    uint8_t parent_hash[SCRIBE_HASH_SIZE];
+    uint8_t parent_root_hash[SCRIBE_HASH_SIZE];
+    uint8_t root_hash[SCRIBE_HASH_SIZE];
+    uint8_t *commit_payload;
+    size_t commit_payload_len;
+    scribe_arena arena;
+    scribe_arena work;
+    commit_object_writer writer;
+    int has_parent = 0;
+    size_t i;
+    size_t work_capacity;
+    scribe_error_t err;
+
+    if (ctx == NULL || !ctx->writable) {
+        return scribe_set_error(SCRIBE_EINVAL, "writable context required");
+    }
+    if (batch == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "commit batch is required");
+    }
+    if (ref == NULL || ref[0] == '\0') {
+        return scribe_set_error(SCRIBE_EINVAL, "target ref is required");
+    }
+    err = read_ref_root_hash(ctx, ref, parent_hash, &has_parent, parent_root_hash);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    if (batch->event_count > (SIZE_MAX - (1024u * 1024u)) / 4096u) {
+        return scribe_set_error(SCRIBE_ENOMEM, "commit batch is too large");
+    }
+    work_capacity = 1024u * 1024u + (batch->event_count * 4096u);
+    if (has_parent) {
+        err = estimate_tree_work_capacity(ctx, parent_root_hash, &work_capacity);
+        if (err != SCRIBE_OK) {
+            return err;
+        }
+    }
+    err = scribe_arena_init(&work, work_capacity);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    err = commit_object_writer_begin(&writer, ctx, batch);
+    if (err != SCRIBE_OK) {
+        scribe_arena_destroy(&work);
+        return err;
+    }
+    if (has_parent) {
+        err = load_tree(ctx, &work, parent_root_hash, &root);
+        if (err != SCRIBE_OK) {
+            commit_object_writer_abort(&writer);
+            scribe_arena_destroy(&work);
+            return err;
+        }
+    } else {
+        root = node_new(&work);
+        if (root == NULL) {
+            commit_object_writer_abort(&writer);
+            scribe_arena_destroy(&work);
+            return SCRIBE_ENOMEM;
+        }
+    }
+    for (i = 0; i < batch->event_count; i++) {
+        err = apply_change(&writer, &work, root, &batch->events[i]);
+        if (err != SCRIBE_OK) {
+            commit_object_writer_abort(&writer);
+            scribe_arena_destroy(&work);
+            return err;
+        }
+    }
+    err = write_tree_recursive(&writer, root, root_hash);
+    if (err != SCRIBE_OK) {
+        commit_object_writer_abort(&writer);
+        scribe_arena_destroy(&work);
+        return err;
+    }
+    err = scribe_arena_init(&arena, 4096u + (batch->message_len * 2u));
+    if (err != SCRIBE_OK) {
+        commit_object_writer_abort(&writer);
+        scribe_arena_destroy(&work);
+        return err;
+    }
+    err = scribe_commit_serialize(root_hash, has_parent ? parent_hash : NULL, batch, &arena, &commit_payload,
+                                  &commit_payload_len);
+    if (err == SCRIBE_OK && has_parent && scribe_hash_cmp(root_hash, parent_root_hash) == 0) {
+        /*
+         * Keep non-main event histories idempotent under the same snapshot
+         * identity rule as refs/heads/main.
+         */
+        scribe_arena_destroy(&arena);
+        commit_object_writer_abort(&writer);
+        scribe_arena_destroy(&work);
+        scribe_hash_copy(out_commit_hash, parent_hash);
+        scribe_log_msg(ctx, SCRIBE_LOG_DEBUG, "commit", "skipped unchanged batch");
+        scribe_log_flush(ctx);
+        return SCRIBE_OK;
+    }
+    if (err == SCRIBE_OK) {
+        err = commit_object_writer_write(&writer, SCRIBE_OBJECT_COMMIT, commit_payload, commit_payload_len,
+                                         out_commit_hash);
+    }
+    if (err == SCRIBE_OK) {
+        err = commit_object_writer_finish(&writer);
+    }
+    scribe_arena_destroy(&arena);
+    scribe_arena_destroy(&work);
+    if (err != SCRIBE_OK) {
+        commit_object_writer_abort(&writer);
+        return err;
+    }
+    err = scribe_refs_update(ctx, ref, out_commit_hash, reason == NULL ? "update" : reason);
     if (err != SCRIBE_OK) {
         return err;
     }
@@ -611,6 +858,7 @@ scribe_error_t scribe_commit_root_internal(scribe_ctx *ctx, const uint8_t root_t
     uint8_t *commit_payload;
     size_t commit_payload_len;
     scribe_arena arena;
+    commit_object_writer writer;
     int has_parent = 0;
     scribe_error_t err;
 
@@ -634,13 +882,23 @@ scribe_error_t scribe_commit_root_internal(scribe_ctx *ctx, const uint8_t root_t
     if (err != SCRIBE_OK) {
         return err;
     }
+    err = commit_object_writer_begin(&writer, ctx, metadata);
+    if (err != SCRIBE_OK) {
+        scribe_arena_destroy(&arena);
+        return err;
+    }
     err = scribe_commit_serialize_allow_empty(root_tree, has_parent ? parent_hash : NULL, metadata, &arena,
                                               &commit_payload, &commit_payload_len);
     if (err == SCRIBE_OK) {
-        err = scribe_object_write(ctx, SCRIBE_OBJECT_COMMIT, commit_payload, commit_payload_len, out_commit_hash);
+        err = commit_object_writer_write(&writer, SCRIBE_OBJECT_COMMIT, commit_payload, commit_payload_len,
+                                         out_commit_hash);
+    }
+    if (err == SCRIBE_OK) {
+        err = commit_object_writer_finish(&writer);
     }
     scribe_arena_destroy(&arena);
     if (err != SCRIBE_OK) {
+        commit_object_writer_abort(&writer);
         return err;
     }
     err = scribe_refs_cas(ctx, "refs/heads/main", has_parent ? parent_hash : NULL, out_commit_hash);

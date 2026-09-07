@@ -8,3 +8,16 @@
 /HEAD
 /config
 /log
+/piero.mp3
+/vito.mp3
+/docker/kubernetes/output/
+
+# Adapter work is local and excluded from the server/CLI v2 release.
+/adapters/
+/docker/
+/tests/integration/mongo-rs/
+/tests/integration/test_mongo_testcontainers.c
+/scripts/smoke-test-adapters.sh
+# Historical benchmark harness targets the pre-HTTP CLI.
+/benchmarks/
+/scripts/benchmark.sh

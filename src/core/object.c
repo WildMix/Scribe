@@ -106,8 +106,9 @@ char *scribe_object_path(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE]) 
 }
 
 /*
- * Checks whether an object file currently exists without reading or verifying
- * it. Writers use this to make content-addressed writes idempotent.
+ * Checks whether an object currently exists in either loose or packed storage
+ * without reading and verifying the full payload. Writers use this to make
+ * content-addressed writes idempotent.
  */
 scribe_error_t scribe_object_has(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE]) {
     char *path = scribe_object_path(ctx, hash);
@@ -118,7 +119,10 @@ scribe_error_t scribe_object_has(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH
     }
     exists = scribe_file_exists(path);
     free(path);
-    return exists ? SCRIBE_OK : scribe_set_error(SCRIBE_ENOT_FOUND, "object not found");
+    if (exists) {
+        return SCRIBE_OK;
+    }
+    return scribe_pack_has(ctx, hash);
 }
 
 /*
@@ -126,8 +130,9 @@ scribe_error_t scribe_object_has(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH
  * object is enveloped, hashed, compressed, and atomically published under the
  * loose-object path derived from the hash.
  */
-scribe_error_t scribe_object_write(scribe_ctx *ctx, uint8_t type, const uint8_t *payload, size_t payload_len,
-                                   uint8_t out_hash[SCRIBE_HASH_SIZE]) {
+scribe_error_t scribe_object_write_loose_opts(scribe_ctx *ctx, uint8_t type, const uint8_t *payload, size_t payload_len,
+                                              int sync_file, int sync_parent, uint8_t out_hash[SCRIBE_HASH_SIZE],
+                                              uint8_t *out_fanout, int *out_written) {
     uint8_t *envelope = NULL;
     size_t envelope_len = 0;
     size_t bound;
@@ -140,6 +145,9 @@ scribe_error_t scribe_object_write(scribe_ctx *ctx, uint8_t type, const uint8_t 
     char *dir;
     scribe_error_t err;
 
+    if (out_written != NULL) {
+        *out_written = 0;
+    }
     if (payload == NULL && payload_len != 0) {
         return scribe_set_error(SCRIBE_EINVAL, "payload is NULL with non-zero length");
     }
@@ -158,6 +166,9 @@ scribe_error_t scribe_object_write(scribe_ctx *ctx, uint8_t type, const uint8_t 
         return err;
     }
     hash_bytes(envelope, envelope_len, out_hash);
+    if (out_fanout != NULL) {
+        *out_fanout = out_hash[0];
+    }
     path = scribe_object_path(ctx, out_hash);
     if (path == NULL) {
         free(envelope);
@@ -206,16 +217,63 @@ scribe_error_t scribe_object_write(scribe_ctx *ctx, uint8_t type, const uint8_t 
         free(compressed);
         return scribe_set_error(SCRIBE_EIO, "zstd compression failed: %s", ZSTD_getErrorName(compressed_len));
     }
-    err = scribe_write_file_atomic(path, compressed, compressed_len);
+    err = scribe_write_file_atomic_opts(path, compressed, compressed_len, sync_file, sync_parent);
     free(path);
     free(compressed);
+    if (err == SCRIBE_OK && out_written != NULL) {
+        *out_written = 1;
+    }
+    return err;
+}
+
+scribe_error_t scribe_object_write(scribe_ctx *ctx, uint8_t type, const uint8_t *payload, size_t payload_len,
+                                   uint8_t out_hash[SCRIBE_HASH_SIZE]) {
+    return scribe_object_write_loose_opts(ctx, type, payload, payload_len, 1, 1, out_hash, NULL, NULL);
+}
+
+scribe_error_t scribe_object_fsync_fanout_dirs(scribe_ctx *ctx, const bool touched[256]) {
+    static const char digits[] = "0123456789abcdef";
+    char *objects;
+    size_t i;
+    scribe_error_t err = SCRIBE_OK;
+
+    if (ctx == NULL || touched == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid object fanout fsync arguments");
+    }
+    objects = scribe_path_join(ctx->repo_path, "objects");
+    if (objects == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    for (i = 0; i < 256u && err == SCRIBE_OK; i++) {
+        char dirpart[3];
+        char *dir;
+
+        if (!touched[i]) {
+            continue;
+        }
+        dirpart[0] = digits[i >> 4u];
+        dirpart[1] = digits[i & 0x0fu];
+        dirpart[2] = '\0';
+        dir = scribe_path_join(objects, dirpart);
+        if (dir == NULL) {
+            err = SCRIBE_ENOMEM;
+            break;
+        }
+        err = scribe_fsync_dir(dir);
+        free(dir);
+    }
+    if (err == SCRIBE_OK) {
+        err = scribe_fsync_dir(objects);
+    }
+    free(objects);
     return err;
 }
 
 /*
- * Reads and verifies one loose object. Verification includes zstd frame
- * validity, BLAKE3 hash equality, envelope type/length framing, and exact
- * payload-length accounting.
+ * Reads and verifies one object. Loose storage is checked first because it is
+ * the low-latency write path and preserves v1 behavior. If no loose file exists,
+ * the pack backend searches published `.idx` files and reads the corresponding
+ * record from `.scribe/packs/`.
  */
 scribe_error_t scribe_object_read(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE], scribe_object *out) {
     char *path;
@@ -237,6 +295,9 @@ scribe_error_t scribe_object_read(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HAS
     err = scribe_read_file(path, &compressed, &compressed_len);
     free(path);
     if (err != SCRIBE_OK) {
+        if (err == SCRIBE_ENOT_FOUND) {
+            return scribe_pack_read_object(ctx, hash, out);
+        }
         return err;
     }
     /*
@@ -400,9 +461,11 @@ static scribe_error_t visit_object_dir(const char *name, void *vctx) {
 }
 
 /*
- * Iterates every loose object hash known to the object store. The iterator uses
- * the storage abstraction rather than exposing filesystem walking to callers so
- * future pack storage can replace this implementation behind the same API.
+ * Iterates every object hash known to the object store. Loose objects are
+ * visited first, followed by objects named by published pack indexes. The
+ * iterator intentionally reports storage entries, so a hash duplicated in loose
+ * and packed storage can be visited twice; fsck treats that as duplicate
+ * storage rather than a different logical object.
  */
 scribe_error_t scribe_object_iter(scribe_ctx *ctx, scribe_object_visit_fn visit, void *user) {
     object_dir_iter it;
@@ -421,12 +484,153 @@ scribe_error_t scribe_object_iter(scribe_ctx *ctx, scribe_object_visit_fn visit,
     it.user = user;
     err = scribe_list_dir(objects, visit_object_dir, &it);
     free(objects);
+    if (err != SCRIBE_OK && err != SCRIBE_ENOT_FOUND) {
+        return err;
+    }
+    return scribe_pack_iter(ctx, visit, user);
+}
+
+typedef struct {
+    scribe_loose_object_visit_fn visit;
+    void *user;
+    char dir_hex[3];
+    char *dir_path;
+} loose_file_iter;
+
+/*
+ * Visits one loose object file with its filesystem metadata. GC uses the mtime
+ * to enforce the prune grace period and the path to unlink only after any pack
+ * publication has completed.
+ */
+static scribe_error_t visit_loose_object_file(const char *name, void *vctx) {
+    loose_file_iter *it = (loose_file_iter *)vctx;
+    char hex[SCRIBE_HEX_HASH_SIZE + 1];
+    uint8_t hash[SCRIBE_HASH_SIZE];
+    char *path;
+    struct stat st;
+    scribe_error_t err;
+
+    if (strlen(name) != 62u || !is_hex_string(name, 62u)) {
+        return SCRIBE_OK;
+    }
+    snprintf(hex, sizeof(hex), "%s%s", it->dir_hex, name);
+    err = scribe_hash_from_hex(hex, hash);
+    if (err != SCRIBE_OK) {
+        return err;
+    }
+    path = scribe_path_join(it->dir_path, name);
+    if (path == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    if (stat(path, &st) != 0) {
+        free(path);
+        return errno == ENOENT ? SCRIBE_OK : scribe_set_error(SCRIBE_EIO, "failed to stat loose object");
+    }
+    if (!S_ISREG(st.st_mode)) {
+        free(path);
+        return SCRIBE_OK;
+    }
+    if (st.st_size < 0 || (uintmax_t)st.st_size > (uintmax_t)SIZE_MAX) {
+        free(path);
+        return scribe_set_error(SCRIBE_EIO, "invalid loose object size");
+    }
+    err = it->visit(hash, path, st.st_mtime, (size_t)st.st_size, it->user);
+    free(path);
+    return err;
+}
+
+typedef struct {
+    scribe_ctx *ctx;
+    scribe_loose_object_visit_fn visit;
+    void *user;
+} loose_dir_iter;
+
+/*
+ * Opens one two-hex-character fanout directory below objects/ and delegates its
+ * object-shaped file names to visit_loose_object_file().
+ */
+static scribe_error_t visit_loose_object_dir(const char *name, void *vctx) {
+    loose_dir_iter *it = (loose_dir_iter *)vctx;
+    loose_file_iter file_it;
+    char *objects;
+    char *dir;
+    scribe_error_t err;
+
+    if (strlen(name) != 2u || !is_hex_string(name, 2u)) {
+        return SCRIBE_OK;
+    }
+    objects = scribe_path_join(it->ctx->repo_path, "objects");
+    if (objects == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    dir = scribe_path_join(objects, name);
+    free(objects);
+    if (dir == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    file_it.visit = it->visit;
+    file_it.user = it->user;
+    file_it.dir_path = dir;
+    file_it.dir_hex[0] = name[0];
+    file_it.dir_hex[1] = name[1];
+    file_it.dir_hex[2] = '\0';
+    err = scribe_list_dir(dir, visit_loose_object_file, &file_it);
+    free(dir);
     return err == SCRIBE_ENOT_FOUND ? SCRIBE_OK : err;
 }
 
 /*
- * Returns the compressed on-disk byte size of a loose object. list-objects uses
- * this only when the user requests the `%C` format placeholder.
+ * Iterates only loose-object storage entries. Unlike scribe_object_iter(), this
+ * deliberately does not visit packs; maintenance commands need to distinguish
+ * the loose files they may prune or roll into packs from immutable pack records.
+ */
+scribe_error_t scribe_loose_object_iter(scribe_ctx *ctx, scribe_loose_object_visit_fn visit, void *user) {
+    loose_dir_iter it;
+    char *objects;
+    scribe_error_t err;
+
+    if (ctx == NULL || visit == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid loose-object iterator arguments");
+    }
+    objects = scribe_path_join(ctx->repo_path, "objects");
+    if (objects == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    it.ctx = ctx;
+    it.visit = visit;
+    it.user = user;
+    err = scribe_list_dir(objects, visit_loose_object_dir, &it);
+    free(objects);
+    return err == SCRIBE_ENOT_FOUND ? SCRIBE_OK : err;
+}
+
+/*
+ * Removes one loose object file by hash. Missing files are treated as success so
+ * gc remains safe if another maintenance process already removed a duplicate
+ * before this process reached it.
+ */
+scribe_error_t scribe_loose_object_delete(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE]) {
+    char *path;
+
+    if (ctx == NULL || hash == NULL) {
+        return scribe_set_error(SCRIBE_EINVAL, "invalid loose-object delete arguments");
+    }
+    path = scribe_object_path(ctx, hash);
+    if (path == NULL) {
+        return SCRIBE_ENOMEM;
+    }
+    if (unlink(path) != 0 && errno != ENOENT) {
+        free(path);
+        return scribe_set_error(SCRIBE_EIO, "failed to delete loose object");
+    }
+    free(path);
+    return SCRIBE_OK;
+}
+
+/*
+ * Returns the compressed on-disk byte size of an object. Loose objects report
+ * their file size; packed objects report the compressed record payload length
+ * stored in the pack index.
  */
 scribe_error_t scribe_object_compressed_size(scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE], size_t *out) {
     struct stat st;
@@ -441,8 +645,10 @@ scribe_error_t scribe_object_compressed_size(scribe_ctx *ctx, const uint8_t hash
     }
     if (stat(path, &st) != 0) {
         free(path);
-        return errno == ENOENT ? scribe_set_error(SCRIBE_ENOT_FOUND, "object not found")
-                               : scribe_set_error(SCRIBE_EIO, "failed to stat object");
+        if (errno == ENOENT) {
+            return scribe_pack_compressed_size(ctx, hash, out);
+        }
+        return scribe_set_error(SCRIBE_EIO, "failed to stat object");
     }
     free(path);
     if (st.st_size < 0 || (uintmax_t)st.st_size > (uintmax_t)SIZE_MAX) {

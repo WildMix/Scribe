@@ -1,106 +1,75 @@
-#!/usr/bin/env sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-COMPOSE_FILE="$ROOT_DIR/docker/docker-compose.yml"
-SMOKE_DIR=/tmp/scribe-smoke
-STORE="$SMOKE_DIR/.scribe"
-MONGO_URI="mongodb://localhost:27018/?directConnection=true"
-MONGO_DB_URI="mongodb://localhost:27018/scribe_test?directConnection=true"
-MONGO_CONTAINER_DB_URI="mongodb://localhost:27017/scribe_test?replicaSet=scribe-rs"
-SCRIBE_PID=
-COMPOSE_STARTED=0
+BUILD_DIR=${SCRIBE_BUILD_DIR:-"$ROOT_DIR/build"}
+export SCRIBE_SMOKE_BUILD="$BUILD_DIR"
 
-cleanup() {
-    if [ -n "$SCRIBE_PID" ] && kill -0 "$SCRIBE_PID" 2>/dev/null; then
-        kill -TERM "$SCRIBE_PID" 2>/dev/null || true
-        wait "$SCRIBE_PID" 2>/dev/null || true
-    fi
-    if [ "$COMPOSE_STARTED" -eq 1 ]; then
-        docker compose -f "$COMPOSE_FILE" down >/dev/null 2>&1 || true
-    fi
-}
+# Use an isolated store and a dynamically allocated port; never touch user data.
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import tempfile
+import time
 
-fail() {
-    echo "SMOKE TEST: FAILED: $*" >&2
-    exit 1
-}
+build = Path(os.environ["SCRIBE_SMOKE_BUILD"]).resolve()
+server_bin, client_bin = build / "scribe", build / "scribe-cli"
 
-mongo_eval() {
-    if command -v mongosh >/dev/null 2>&1; then
-        mongosh "$MONGO_DB_URI" --eval "$1"
-    else
-        docker compose -f "$COMPOSE_FILE" exec -T mongo mongosh "$MONGO_CONTAINER_DB_URI" --eval "$1"
-    fi
-}
+def run(*args):
+    return subprocess.check_output([str(arg) for arg in args], timeout=30)
 
-trap cleanup EXIT INT TERM
+with tempfile.TemporaryDirectory(prefix="scribe-smoke-") as root:
+    root = Path(root)
+    store = root / ".scribe"
+    payload = bytes(range(256)) * 256
+    source = root / "content.bin"
+    source.write_bytes(payload)
+    run(server_bin, "init", store)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    url = f"http://127.0.0.1:{port}"
 
-cd "$ROOT_DIR"
+    def client(*args):
+        return run(client_bin, "--url", url, *args)
 
-echo "1. docker compose -f docker/docker-compose.yml up -d --wait"
-docker compose -f docker/docker-compose.yml up -d --wait
-COMPOSE_STARTED=1
-
-echo "2. rm -rf /tmp/scribe-smoke && mkdir -p /tmp/scribe-smoke"
-rm -rf "$SMOKE_DIR" && mkdir -p "$SMOKE_DIR"
-
-echo "3. ./build/scribe init /tmp/scribe-smoke/.scribe"
-./build/scribe init "$STORE"
-
-echo "4. ./build/scribe mongo-watch \"mongodb://localhost:27018/?directConnection=true\" --store /tmp/scribe-smoke/.scribe &"
-./build/scribe mongo-watch "$MONGO_URI" --store "$STORE" >"$SMOKE_DIR/watch.out" 2>"$SMOKE_DIR/watch.err" &
-SCRIBE_PID=$!
-
-echo "5. sleep 2"
-sleep 2
-if ! kill -0 "$SCRIBE_PID" 2>/dev/null; then
-    cat "$SMOKE_DIR/watch.err" >&2 || true
-    fail "mongo-watch exited before the write"
-fi
-ready_wait=0
-while ! grep -F "watching MongoDB change stream" "$SMOKE_DIR/watch.err" >/dev/null 2>&1; do
-    if ! kill -0 "$SCRIBE_PID" 2>/dev/null; then
-        cat "$SMOKE_DIR/watch.err" >&2 || true
-        fail "mongo-watch exited before entering steady-state"
-    fi
-    ready_wait=$((ready_wait + 1))
-    if [ "$ready_wait" -gt 30 ]; then
-        cat "$SMOKE_DIR/watch.err" >&2 || true
-        fail "mongo-watch did not enter steady-state"
-    fi
-    sleep 1
-done
-
-echo "6. mongosh \"mongodb://localhost:27018/scribe_test?directConnection=true\" --eval 'db.users.insertOne({_id: \"alice\", role: \"admin\"})'"
-mongo_eval 'db.users.insertOne({_id: "alice", role: "admin"})' >/dev/null
-
-echo "7. sleep 1"
-sleep 1
-
-echo "8. kill -TERM \$SCRIBE_PID && wait \$SCRIBE_PID"
-kill -TERM "$SCRIBE_PID"
-wait "$SCRIBE_PID"
-SCRIBE_PID=
-
-echo "9. ./build/scribe --store /tmp/scribe-smoke/.scribe log"
-./build/scribe --store "$STORE" log >"$SMOKE_DIR/log.out"
-cat "$SMOKE_DIR/log.out"
-
-echo "10. ./build/scribe --store /tmp/scribe-smoke/.scribe diff HEAD~1 HEAD"
-./build/scribe --store "$STORE" diff HEAD~1 HEAD >"$SMOKE_DIR/diff.out"
-cat "$SMOKE_DIR/diff.out"
-
-echo "11. docker compose -f docker/docker-compose.yml down"
-docker compose -f docker/docker-compose.yml down
-COMPOSE_STARTED=0
-
-commit_count=$(grep -c '^commit ' "$SMOKE_DIR/log.out" || true)
-if [ "$commit_count" -lt 2 ]; then
-    fail "expected at least two commits, found $commit_count"
-fi
-if ! grep -F 'A scribe_test/users/"alice"' "$SMOKE_DIR/diff.out" >/dev/null; then
-    fail "expected alice addition in HEAD~1..HEAD diff"
-fi
-
-echo "SMOKE TEST: PASSED"
+    for cycle in range(2):
+        with (root / f"server-{cycle}.log").open("wb") as log:
+            server = subprocess.Popen([str(server_bin), "--store", str(store),
+                                       "--listen", f"127.0.0.1:{port}"], stdout=log, stderr=log)
+            try:
+                for attempt in range(100):
+                    if server.poll() is not None:
+                        raise RuntimeError("server exited during startup")
+                    try:
+                        client("info")
+                        break
+                    except subprocess.CalledProcessError:
+                        time.sleep(0.05)
+                else:
+                    raise RuntimeError("server did not become ready")
+                if cycle == 0:
+                    first = json.loads(client("ingest", "--path", "smoke/content",
+                                              "--message", "smoke", "--file", source))
+                    retry = json.loads(client("ingest", "--path", "smoke/content", "--file", source))
+                    assert first == retry, "unchanged retry created a commit"
+                assert client("show", "HEAD:smoke/content") == payload, "payload mismatch"
+                assert b"smoke" in client("log", "--oneline")
+            finally:
+                server.terminate()
+                try:
+                    server.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+        run(server_bin, "--store", store, "fsck")
+        if cycle == 0:
+            run(server_bin, "--store", store, "gc", "--pack")
+    logs = (store / "scribe_server.log").read_text()
+    assert "request started: method=PUT" in logs
+    assert "status=200" in logs
+print("SMOKE TEST: PASSED")
+PY

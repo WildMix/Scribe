@@ -43,8 +43,8 @@ static scribe_error_t validate_batch(const scribe_change_batch *batch, int allow
      * The commit payload is line-oriented text, so fields that become headers
      * cannot contain tabs or newlines. Event paths also reject tabs/newlines so
      * tree listing and diff output remain unambiguous. A NULL payload with
-     * length zero is the only tombstone representation; a non-NULL payload must
-     * have nonzero length.
+     * length zero is the tombstone representation. A non-NULL payload is a blob
+     * and may have length zero, which represents an empty blob.
      */
     if (batch == NULL || (!allow_empty && (batch->events == NULL || batch->event_count == 0)) ||
         (batch->events == NULL && batch->event_count != 0) || (batch->events != NULL && batch->event_count == 0)) {
@@ -66,7 +66,7 @@ static scribe_error_t validate_batch(const scribe_change_batch *batch, int allow
         if (ev->path == NULL || ev->path_len == 0) {
             return scribe_set_error(SCRIBE_EMALFORMED, "event path is empty");
         }
-        if ((ev->payload == NULL && ev->payload_len != 0) || (ev->payload != NULL && ev->payload_len == 0)) {
+        if (ev->payload == NULL && ev->payload_len != 0) {
             return scribe_set_error(SCRIBE_EMALFORMED, "invalid tombstone/payload pair");
         }
         for (j = 0; j < ev->path_len; j++) {

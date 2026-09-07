@@ -1,8 +1,8 @@
 /*
  * Repository integrity checker.
  *
- * The fsck command verifies the reachable object graph starting from
- * refs/heads/main, then scans loose objects to report valid but unreachable
+ * The fsck command verifies the reachable object graph starting from every
+ * direct ref under `.scribe/refs`, then scans objects to report valid but unreachable
  * objects as dangling. Dangling objects are warnings in v1 because interrupted
  * writes can leave them behind before a ref update publishes a commit.
  */
@@ -14,38 +14,33 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct {
     scribe_ctx *ctx;
-    uint8_t *hashes;
-    size_t count;
-    size_t cap;
+    scribe_hash_set visited;
+    scribe_hash_set storage;
     size_t dangling;
+    size_t duplicates;
+    size_t refs;
 } fsck_state;
 
 /*
- * fsck keeps an in-memory set of hashes reached from refs/heads/main. The set
+ * fsck keeps an in-memory set of hashes reached from refs. The set
  * is intentionally simple because v1 fsck is an operator diagnostic command,
  * not a high-throughput query path. The visited set has two jobs:
  *
  *   1. avoid walking the same object more than once when multiple commits share
- *      subtrees or blobs;
+ *      subtrees or blobs, including history shared by branches/tags;
  *   2. identify dangling loose objects during the later full object scan.
  */
 /*
- * Returns whether the visited set already contains a hash. The set is linear
+ * Returns whether the visited set already contains a hash. The set is linea
  * because fsck is an operator diagnostic path and typical v1 stores are small
  * enough that clarity is more important than a hash table here.
  */
 static int visited_has(fsck_state *st, const uint8_t hash[SCRIBE_HASH_SIZE]) {
-    size_t i;
-
-    for (i = 0; i < st->count; i++) {
-        if (memcmp(st->hashes + i * SCRIBE_HASH_SIZE, hash, SCRIBE_HASH_SIZE) == 0) {
-            return 1;
-        }
-    }
-    return 0;
+    return scribe_hash_set_has(&st->visited, hash);
 }
 
 /*
@@ -53,24 +48,11 @@ static int visited_has(fsck_state *st, const uint8_t hash[SCRIBE_HASH_SIZE]) {
  * lets graph walking avoid recursing through shared subtrees more than once.
  */
 static scribe_error_t visited_add(fsck_state *st, const uint8_t hash[SCRIBE_HASH_SIZE], int *already) {
-    uint8_t *grown;
+    return scribe_hash_set_add(&st->visited, hash, already);
+}
 
-    *already = visited_has(st, hash);
-    if (*already) {
-        return SCRIBE_OK;
-    }
-    if (st->count == st->cap) {
-        size_t new_cap = st->cap == 0 ? 128u : st->cap * 2u;
-        grown = (uint8_t *)realloc(st->hashes, new_cap * SCRIBE_HASH_SIZE);
-        if (grown == NULL) {
-            return scribe_set_error(SCRIBE_ENOMEM, "failed to grow fsck visited set");
-        }
-        st->hashes = grown;
-        st->cap = new_cap;
-    }
-    memcpy(st->hashes + st->count * SCRIBE_HASH_SIZE, hash, SCRIBE_HASH_SIZE);
-    st->count++;
-    return SCRIBE_OK;
+static scribe_error_t storage_add(fsck_state *st, const uint8_t hash[SCRIBE_HASH_SIZE], int *already) {
+    return scribe_hash_set_add(&st->storage, hash, already);
 }
 
 static scribe_error_t fsck_walk_object(fsck_state *st, const uint8_t hash[SCRIBE_HASH_SIZE], uint8_t expected_type);
@@ -183,114 +165,139 @@ static scribe_error_t fsck_walk_object(fsck_state *st, const uint8_t hash[SCRIBE
     return err;
 }
 
-typedef struct {
-    fsck_state *st;
-    char dir_hex[3];
-} dangling_dir_ctx;
-
 /*
- * Visits one loose object file during the dangling-object scan. Files whose
- * names are not valid loose-object suffixes are ignored; valid object-shaped
- * names not reached earlier are reported as dangling.
+ * Visits every storage entry reported by the object-store iterator. At this
+ * point pack_validate_all() has already verified packed records directly, while
+ * scribe_object_read verifies the normal read path for loose or packed objects.
  */
-static scribe_error_t visit_object_file(const char *name, void *vctx) {
-    dangling_dir_ctx *dctx = (dangling_dir_ctx *)vctx;
+static scribe_error_t fsck_scan_object(const uint8_t hash[SCRIBE_HASH_SIZE], void *vctx) {
+    fsck_state *st = (fsck_state *)vctx;
+    scribe_object obj;
     char hex[SCRIBE_HEX_HASH_SIZE + 1];
-    uint8_t hash[SCRIBE_HASH_SIZE];
+    int already = 0;
     scribe_error_t err;
 
-    if (strlen(name) != 62u) {
-        return SCRIBE_OK;
-    }
-    snprintf(hex, sizeof(hex), "%s%s", dctx->dir_hex, name);
-    err = scribe_hash_from_hex(hex, hash);
+    err = storage_add(st, hash, &already);
     if (err != SCRIBE_OK) {
+        return err;
+    }
+    scribe_hash_to_hex(hash, hex);
+    if (already) {
+        printf("warning: duplicate storage entry %s\n", hex);
+        st->duplicates++;
         return SCRIBE_OK;
     }
+    err = scribe_object_read(st->ctx, hash, &obj);
+    if (err != SCRIBE_OK) {
+        return err == SCRIBE_ENOT_FOUND ? scribe_set_error(SCRIBE_ECORRUPT, "stored object disappeared during fsck")
+                                        : err;
+    }
+    scribe_object_free(&obj);
     /*
-     * Dangling means "present in objects/ but absent from the reachability set
-     * built from refs/heads/main". It is only a warning in v1. Interrupted
-     * writes may leave valid objects on disk before the ref update publishes a
-     * commit, and Scribe has no garbage collector yet.
+     * Dangling means "present in the object store but absent from the
+     * reachability set built from all refs". It is only a warning:
+     * interrupted writes may leave valid objects on disk before a ref update
+     * publishes a commit, and pruning is deferred to v2 gc.
      */
-    if (!visited_has(dctx->st, hash)) {
+    if (!visited_has(st, hash)) {
         printf("warning: dangling object %s\n", hex);
-        dctx->st->dangling++;
+        st->dangling++;
     }
     return SCRIBE_OK;
 }
 
 /*
- * Visits one two-character fanout directory under objects/ and delegates each
- * file to visit_object_file(). Missing directories are tolerated so sparse
- * object stores do not fail fsck.
+ * Seeds reachability from one direct ref. M4 branches and tags are first-class
+ * roots for fsck, so a commit reachable only from a tag must not be reported as
+ * dangling.
  */
-static scribe_error_t visit_object_dir(const char *name, void *vctx) {
-    fsck_state *st = (fsck_state *)vctx;
-    char *objects;
-    char *dir;
-    dangling_dir_ctx dctx;
+static scribe_error_t fsck_visit_ref(const char *name, const uint8_t hash[SCRIBE_HASH_SIZE], void *user) {
+    fsck_state *st = (fsck_state *)user;
+
+    (void)name;
+    st->refs++;
+    return fsck_walk_object(st, hash, SCRIBE_OBJECT_COMMIT);
+}
+
+static void fsck_timestamp_utc(char out[32]) {
+    time_t now = time(NULL);
+    struct tm tm_utc;
+
+    if (gmtime_r(&now, &tm_utc) == NULL || strftime(out, 32u, "%Y-%m-%dT%H:%M:%SZ", &tm_utc) == 0) {
+        strcpy(out, "1970-01-01T00:00:00Z");
+    }
+}
+
+static scribe_error_t fsck_write_health(scribe_ctx *ctx, const char *status) {
+    char ts[32];
+    char body[128];
+    char *path;
+    int n;
     scribe_error_t err;
 
-    if (strlen(name) != 2u) {
-        return SCRIBE_OK;
+    fsck_timestamp_utc(ts);
+    n = snprintf(body, sizeof(body), "last_fsck_at %s\nlast_fsck_status %s\n", ts, status);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return scribe_set_error(SCRIBE_ENOMEM, "fsck health record is too large");
     }
-    objects = scribe_path_join(st->ctx->repo_path, "objects");
-    if (objects == NULL) {
-        return SCRIBE_ENOMEM;
+    path = scribe_path_join(ctx->repo_path, "fsck-status");
+    if (path == NULL) {
+        return scribe_set_error(SCRIBE_ENOMEM, "failed to allocate fsck health path");
     }
-    dir = scribe_path_join(objects, name);
-    free(objects);
-    if (dir == NULL) {
-        return SCRIBE_ENOMEM;
+    err = scribe_write_file_atomic(path, (const uint8_t *)body, (size_t)n);
+    free(path);
+    return err;
+}
+
+static scribe_error_t fsck_return_with_health(scribe_ctx *ctx, scribe_error_t err) {
+    scribe_error_t health_err;
+
+    if (err == SCRIBE_OK) {
+        return fsck_write_health(ctx, "ok");
     }
-    dctx.st = st;
-    dctx.dir_hex[0] = name[0];
-    dctx.dir_hex[1] = name[1];
-    dctx.dir_hex[2] = '\0';
-    err = scribe_list_dir(dir, visit_object_file, &dctx);
-    free(dir);
-    return err == SCRIBE_ENOT_FOUND ? SCRIBE_OK : err;
+    health_err = fsck_write_health(ctx, "failed");
+    (void)health_err;
+    return err;
 }
 
 /*
- * Implements `scribe fsck`: build the reachable set from main history, scan the
- * loose object store for unvisited hashes, print dangling warnings, and finish
+ * Implements `scribe fsck`: build the reachable set from every direct ref, scan
+ * the object store for unvisited hashes, print dangling warnings, and finish
  * with a summary count.
  */
 scribe_error_t scribe_cli_fsck(scribe_ctx *ctx) {
     fsck_state st;
-    uint8_t head[SCRIBE_HASH_SIZE];
-    char *objects;
+    size_t packed_objects = 0;
     scribe_error_t err;
 
     memset(&st, 0, sizeof(st));
     st.ctx = ctx;
-    err = scribe_refs_read(ctx, "refs/heads/main", head);
-    if (err == SCRIBE_ENOT_FOUND) {
+    err = scribe_pack_validate_all(ctx, &packed_objects);
+    if (err != SCRIBE_OK) {
+        return fsck_return_with_health(ctx, err);
+    }
+    (void)packed_objects;
+    err = scribe_refs_iter(ctx, fsck_visit_ref, &st);
+    if (err != SCRIBE_OK) {
+        scribe_hash_set_destroy(&st.visited);
+        scribe_hash_set_destroy(&st.storage);
+        return fsck_return_with_health(ctx, err);
+    }
+    if (st.refs == 0u) {
         printf("fsck: no commits\n");
-        return SCRIBE_OK;
     }
+    err = scribe_object_iter(ctx, fsck_scan_object, &st);
     if (err != SCRIBE_OK) {
-        return scribe_set_error(SCRIBE_ECORRUPT, "invalid main ref");
+        scribe_hash_set_destroy(&st.visited);
+        scribe_hash_set_destroy(&st.storage);
+        return fsck_return_with_health(ctx, err);
     }
-    err = fsck_walk_object(&st, head, SCRIBE_OBJECT_COMMIT);
-    if (err != SCRIBE_OK) {
-        free(st.hashes);
-        return err;
+    printf("fsck: %zu reachable objects, %zu dangling objects", st.visited.count, st.dangling);
+    if (st.duplicates != 0u) {
+        printf(", %zu duplicate storage entries", st.duplicates);
     }
-    objects = scribe_path_join(ctx->repo_path, "objects");
-    if (objects == NULL) {
-        free(st.hashes);
-        return SCRIBE_ENOMEM;
-    }
-    err = scribe_list_dir(objects, visit_object_dir, &st);
-    free(objects);
-    if (err != SCRIBE_OK && err != SCRIBE_ENOT_FOUND) {
-        free(st.hashes);
-        return err;
-    }
-    printf("fsck: %zu reachable objects, %zu dangling objects\n", st.count, st.dangling);
-    free(st.hashes);
-    return SCRIBE_OK;
+    printf("\n");
+    scribe_hash_set_destroy(&st.visited);
+    scribe_hash_set_destroy(&st.storage);
+    return fsck_return_with_health(ctx, SCRIBE_OK);
 }

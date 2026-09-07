@@ -29,9 +29,21 @@ scribe_error_t scribe_default_config(scribe_config *cfg) {
     cfg->worker_threads = 0;
     cfg->event_queue_capacity = 64;
     cfg->queue_stall_warn_seconds = 30;
+    cfg->pack_target_size = 1073741824u;
+    cfg->pack_target_object_count = 1000000u;
+    cfg->pack_dictionary_enabled = true;
+    cfg->pack_dictionary_sample = 1024u;
+    cfg->pack_rollup_loose_threshold = 100000u;
+    cfg->pack_rollup_size_threshold = 1073741824u;
+    cfg->commit_storage = SCRIBE_COMMIT_STORAGE_AUTO;
+    cfg->commit_pack_event_threshold = 1000u;
+    cfg->commit_pack_payload_threshold = 16777216u;
+    cfg->commit_loose_fsync = SCRIBE_LOOSE_FSYNC_COMMIT;
+    cfg->gc_prune_grace_days = 14;
     cfg->adapter_require_pre_post_images = false;
     cfg->adapter_coalesce_window_ms = 0;
     strcpy(cfg->adapter_excluded_databases, "admin,local,config");
+    cfg->adapter_attribution_field[0] = '\0';
     return SCRIBE_OK;
 }
 
@@ -42,7 +54,7 @@ scribe_error_t scribe_default_config(scribe_config *cfg) {
  */
 scribe_error_t scribe_write_config(const char *repo_path, const scribe_config *cfg) {
     char *path;
-    char buf[512];
+    char buf[1536];
     int n;
     scribe_error_t err;
 
@@ -58,14 +70,37 @@ scribe_error_t scribe_write_config(const char *repo_path, const scribe_config *c
                  "worker_threads = %d\n"
                  "event_queue_capacity = %zu\n"
                  "queue_stall_warn_seconds = %d\n"
+                 "pack.target_size = %zu\n"
+                 "pack.target_object_count = %zu\n"
+                 "pack.dictionary_enabled = %s\n"
+                 "pack.dictionary_sample = %zu\n"
+                 "pack.rollup_loose_threshold = %zu\n"
+                 "pack.rollup_size_threshold = %zu\n"
+                 "commit.storage = %s\n"
+                 "commit.pack_event_threshold = %zu\n"
+                 "commit.pack_payload_threshold = %zu\n"
+                 "commit.loose_fsync = %s\n"
+                 "gc.prune_grace_days = %d\n"
                  "\n"
                  "adapter.name = mongodb\n"
                  "adapter.mongodb.excluded_databases = %s\n"
                  "adapter.mongodb.require_pre_post_images = %s\n"
-                 "adapter.mongodb.coalesce_window_ms = %d\n",
+                 "adapter.mongodb.coalesce_window_ms = %d\n"
+                 "adapter.mongodb.attribution_field = %s\n",
                  cfg->scribe_format_version, cfg->compression_level, cfg->worker_threads, cfg->event_queue_capacity,
-                 cfg->queue_stall_warn_seconds, cfg->adapter_excluded_databases,
-                 cfg->adapter_require_pre_post_images ? "true" : "false", cfg->adapter_coalesce_window_ms);
+                 cfg->queue_stall_warn_seconds, cfg->pack_target_size, cfg->pack_target_object_count,
+                 cfg->pack_dictionary_enabled ? "true" : "false", cfg->pack_dictionary_sample,
+                 cfg->pack_rollup_loose_threshold, cfg->pack_rollup_size_threshold,
+                 cfg->commit_storage == SCRIBE_COMMIT_STORAGE_PACK    ? "pack"
+                 : cfg->commit_storage == SCRIBE_COMMIT_STORAGE_LOOSE ? "loose"
+                                                                      : "auto",
+                 cfg->commit_pack_event_threshold, cfg->commit_pack_payload_threshold,
+                 cfg->commit_loose_fsync == SCRIBE_LOOSE_FSYNC_NONE     ? "none"
+                 : cfg->commit_loose_fsync == SCRIBE_LOOSE_FSYNC_COMMIT ? "commit"
+                                                                        : "per_object",
+                 cfg->gc_prune_grace_days, cfg->adapter_excluded_databases,
+                 cfg->adapter_require_pre_post_images ? "true" : "false", cfg->adapter_coalesce_window_ms,
+                 cfg->adapter_attribution_field);
     if (n < 0 || (size_t)n >= sizeof(buf)) {
         free(path);
         return scribe_set_error(SCRIBE_ECONFIG, "config is too large");
@@ -119,6 +154,54 @@ static scribe_error_t parse_size(const char *s, size_t *out) {
     }
     *out = (size_t)v;
     return SCRIBE_OK;
+}
+
+/*
+ * Parses a strict true/false boolean value. Configuration deliberately avoids
+ * accepting aliases such as 1/0 so operator typos are caught consistently.
+ */
+static scribe_error_t parse_bool(const char *s, bool *out) {
+    if (strcmp(s, "true") == 0) {
+        *out = true;
+        return SCRIBE_OK;
+    }
+    if (strcmp(s, "false") == 0) {
+        *out = false;
+        return SCRIBE_OK;
+    }
+    return scribe_set_error(SCRIBE_ECONFIG, "invalid boolean '%s'", s);
+}
+
+static scribe_error_t parse_commit_storage(const char *s, scribe_commit_storage_mode *out) {
+    if (strcmp(s, "auto") == 0) {
+        *out = SCRIBE_COMMIT_STORAGE_AUTO;
+        return SCRIBE_OK;
+    }
+    if (strcmp(s, "loose") == 0) {
+        *out = SCRIBE_COMMIT_STORAGE_LOOSE;
+        return SCRIBE_OK;
+    }
+    if (strcmp(s, "pack") == 0) {
+        *out = SCRIBE_COMMIT_STORAGE_PACK;
+        return SCRIBE_OK;
+    }
+    return scribe_set_error(SCRIBE_ECONFIG, "invalid commit storage policy '%s'", s);
+}
+
+static scribe_error_t parse_loose_fsync(const char *s, scribe_loose_fsync_mode *out) {
+    if (strcmp(s, "per_object") == 0) {
+        *out = SCRIBE_LOOSE_FSYNC_PER_OBJECT;
+        return SCRIBE_OK;
+    }
+    if (strcmp(s, "commit") == 0) {
+        *out = SCRIBE_LOOSE_FSYNC_COMMIT;
+        return SCRIBE_OK;
+    }
+    if (strcmp(s, "none") == 0) {
+        *out = SCRIBE_LOOSE_FSYNC_NONE;
+        return SCRIBE_OK;
+    }
+    return scribe_set_error(SCRIBE_ECONFIG, "invalid loose-object fsync policy '%s'", s);
 }
 
 /*
@@ -214,6 +297,61 @@ scribe_error_t scribe_read_config(const char *repo_path, scribe_config *cfg) {
                 return err;
             }
             seen |= 1u << 6;
+        } else if (strcmp(key, "pack.target_size") == 0) {
+            if ((err = parse_size(value, &cfg->pack_target_size)) != SCRIBE_OK) {
+                free(bytes);
+                return err;
+            }
+        } else if (strcmp(key, "pack.target_object_count") == 0) {
+            if ((err = parse_size(value, &cfg->pack_target_object_count)) != SCRIBE_OK) {
+                free(bytes);
+                return err;
+            }
+        } else if (strcmp(key, "pack.dictionary_enabled") == 0) {
+            if ((err = parse_bool(value, &cfg->pack_dictionary_enabled)) != SCRIBE_OK) {
+                free(bytes);
+                return err;
+            }
+        } else if (strcmp(key, "pack.dictionary_sample") == 0) {
+            if ((err = parse_size(value, &cfg->pack_dictionary_sample)) != SCRIBE_OK) {
+                free(bytes);
+                return err;
+            }
+        } else if (strcmp(key, "pack.rollup_loose_threshold") == 0) {
+            if ((err = parse_size(value, &cfg->pack_rollup_loose_threshold)) != SCRIBE_OK) {
+                free(bytes);
+                return err;
+            }
+        } else if (strcmp(key, "pack.rollup_size_threshold") == 0) {
+            if ((err = parse_size(value, &cfg->pack_rollup_size_threshold)) != SCRIBE_OK) {
+                free(bytes);
+                return err;
+            }
+        } else if (strcmp(key, "commit.storage") == 0) {
+            if ((err = parse_commit_storage(value, &cfg->commit_storage)) != SCRIBE_OK) {
+                free(bytes);
+                return err;
+            }
+        } else if (strcmp(key, "commit.pack_event_threshold") == 0) {
+            if ((err = parse_size(value, &cfg->commit_pack_event_threshold)) != SCRIBE_OK) {
+                free(bytes);
+                return err;
+            }
+        } else if (strcmp(key, "commit.pack_payload_threshold") == 0) {
+            if ((err = parse_size(value, &cfg->commit_pack_payload_threshold)) != SCRIBE_OK) {
+                free(bytes);
+                return err;
+            }
+        } else if (strcmp(key, "commit.loose_fsync") == 0) {
+            if ((err = parse_loose_fsync(value, &cfg->commit_loose_fsync)) != SCRIBE_OK) {
+                free(bytes);
+                return err;
+            }
+        } else if (strcmp(key, "gc.prune_grace_days") == 0) {
+            if ((err = parse_int(value, &cfg->gc_prune_grace_days)) != SCRIBE_OK) {
+                free(bytes);
+                return err;
+            }
         } else if (strcmp(key, "adapter.name") == 0) {
             if (strcmp(value, "mongodb") != 0) {
                 free(bytes);
@@ -228,13 +366,9 @@ scribe_error_t scribe_read_config(const char *repo_path, scribe_config *cfg) {
             strcpy(cfg->adapter_excluded_databases, value);
             seen |= 1u << 8;
         } else if (strcmp(key, "adapter.mongodb.require_pre_post_images") == 0) {
-            if (strcmp(value, "true") == 0) {
-                cfg->adapter_require_pre_post_images = true;
-            } else if (strcmp(value, "false") == 0) {
-                cfg->adapter_require_pre_post_images = false;
-            } else {
+            if ((err = parse_bool(value, &cfg->adapter_require_pre_post_images)) != SCRIBE_OK) {
                 free(bytes);
-                return scribe_set_error(SCRIBE_ECONFIG, "invalid boolean '%s'", value);
+                return err;
             }
             seen |= 1u << 9;
         } else if (strcmp(key, "adapter.mongodb.coalesce_window_ms") == 0) {
@@ -243,6 +377,12 @@ scribe_error_t scribe_read_config(const char *repo_path, scribe_config *cfg) {
                 return err;
             }
             seen |= 1u << 10;
+        } else if (strcmp(key, "adapter.mongodb.attribution_field") == 0) {
+            if (strlen(value) >= sizeof(cfg->adapter_attribution_field)) {
+                free(bytes);
+                return scribe_set_error(SCRIBE_ECONFIG, "attribution field name too long");
+            }
+            strcpy(cfg->adapter_attribution_field, value);
         } else {
             /*
              * Unknown keys are configuration errors rather than warnings. This

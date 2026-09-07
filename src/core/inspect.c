@@ -16,12 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-    uint8_t *hashes;
-    size_t count;
-    size_t cap;
-} hash_set;
-
 /*
  * Maps an object type byte to the public type string used in list/tree output.
  * NULL means the type is not valid in the current context.
@@ -54,60 +48,6 @@ static int type_mask(uint8_t type) {
         return SCRIBE_LIST_TYPE_COMMIT;
     }
     return 0;
-}
-
-/*
- * Returns whether an in-memory hash set already contains a hash. The set is a
- * simple linear array because reachable-listing is an inspection command.
- */
-static int hash_set_has(const hash_set *set, const uint8_t hash[SCRIBE_HASH_SIZE]) {
-    size_t i;
-
-    for (i = 0; i < set->count; i++) {
-        if (memcmp(set->hashes + i * SCRIBE_HASH_SIZE, hash, SCRIBE_HASH_SIZE) == 0) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/*
- * Adds a hash to the reachable set, growing the backing array as needed. The
- * already flag lets callers avoid re-walking shared history or shared subtrees.
- */
-static scribe_error_t hash_set_add(hash_set *set, const uint8_t hash[SCRIBE_HASH_SIZE], int *already) {
-    uint8_t *grown;
-
-    *already = hash_set_has(set, hash);
-    if (*already) {
-        return SCRIBE_OK;
-    }
-    if (set->count == set->cap) {
-        size_t new_cap = set->cap == 0 ? 128u : set->cap * 2u;
-        if (new_cap < set->cap || new_cap > SIZE_MAX / SCRIBE_HASH_SIZE) {
-            return scribe_set_error(SCRIBE_ENOMEM, "reachable object set is too large");
-        }
-        grown = (uint8_t *)realloc(set->hashes, new_cap * SCRIBE_HASH_SIZE);
-        if (grown == NULL) {
-            return scribe_set_error(SCRIBE_ENOMEM, "failed to grow reachable object set");
-        }
-        set->hashes = grown;
-        set->cap = new_cap;
-    }
-    memcpy(set->hashes + set->count * SCRIBE_HASH_SIZE, hash, SCRIBE_HASH_SIZE);
-    set->count++;
-    return SCRIBE_OK;
-}
-
-/*
- * Frees the memory owned by a hash set and clears it. This is safe to call on an
- * empty or partially initialized set.
- */
-static void hash_set_destroy(hash_set *set) {
-    if (set != NULL) {
-        free(set->hashes);
-        memset(set, 0, sizeof(*set));
-    }
 }
 
 /*
@@ -265,17 +205,21 @@ static scribe_error_t print_tree_entries(scribe_ctx *ctx, const uint8_t tree_has
 }
 
 /*
- * Implements `scribe ls-tree`. Tree hashes are listed directly, commit hashes
- * are resolved to their root tree, and blob hashes fail because they have no entries.
+ * Implements `scribe-cli ls-tree`. Tree hashes are listed directly; commit
+ * hashes and revision placeholders such as HEAD/HEAD~N resolve to their root
+ * tree; blob hashes fail because they have no entries.
  */
-scribe_error_t scribe_cli_ls_tree(scribe_ctx *ctx, const char *hex) {
+scribe_error_t scribe_cli_ls_tree(scribe_ctx *ctx, const char *spec) {
     uint8_t hash[SCRIBE_HASH_SIZE];
     uint8_t tree_hash[SCRIBE_HASH_SIZE];
     scribe_object obj;
-    scribe_error_t err = scribe_hash_from_hex(hex, hash);
+    scribe_error_t err = scribe_hash_from_hex(spec, hash);
 
     if (err != SCRIBE_OK) {
-        return err;
+        err = scribe_resolve_commit(ctx, spec, hash);
+        if (err != SCRIBE_OK) {
+            return err;
+        }
     }
     err = scribe_object_read(ctx, hash, &obj);
     if (err != SCRIBE_OK) {
@@ -309,14 +253,14 @@ scribe_error_t scribe_cli_ls_tree(scribe_ctx *ctx, const char *hex) {
     return print_tree_entries(ctx, tree_hash);
 }
 
-static scribe_error_t walk_reachable_object(hash_set *set, scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE],
+static scribe_error_t walk_reachable_object(scribe_hash_set *set, scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE],
                                             uint8_t expected_type);
 
 /*
  * Adds all child objects referenced by a reachable tree to the reachable set.
  * Each child is walked according to the type recorded in the tree entry.
  */
-static scribe_error_t walk_reachable_tree(hash_set *set, scribe_ctx *ctx, scribe_object *obj) {
+static scribe_error_t walk_reachable_tree(scribe_hash_set *set, scribe_ctx *ctx, scribe_object *obj) {
     scribe_arena arena;
     scribe_tree_entry *entries = NULL;
     size_t count = 0;
@@ -351,7 +295,7 @@ static scribe_error_t walk_reachable_tree(hash_set *set, scribe_ctx *ctx, scribe
  * Adds the root tree and parent commit referenced by a reachable commit. This
  * makes --reachable include transitive history, not only the HEAD snapshot.
  */
-static scribe_error_t walk_reachable_commit(hash_set *set, scribe_ctx *ctx, scribe_object *obj) {
+static scribe_error_t walk_reachable_commit(scribe_hash_set *set, scribe_ctx *ctx, scribe_object *obj) {
     scribe_arena arena;
     scribe_commit_view view;
     scribe_error_t err = scribe_arena_init(&arena, obj->payload_len + 4096u);
@@ -374,11 +318,11 @@ static scribe_error_t walk_reachable_commit(hash_set *set, scribe_ctx *ctx, scri
  * Adds and verifies one object in the reachable walk. Expected type mismatches
  * are corruption because parent objects define the child type contract.
  */
-static scribe_error_t walk_reachable_object(hash_set *set, scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE],
+static scribe_error_t walk_reachable_object(scribe_hash_set *set, scribe_ctx *ctx, const uint8_t hash[SCRIBE_HASH_SIZE],
                                             uint8_t expected_type) {
     scribe_object obj;
     int already = 0;
-    scribe_error_t err = hash_set_add(set, hash, &already);
+    scribe_error_t err = scribe_hash_set_add(set, hash, &already);
 
     if (err != SCRIBE_OK || already) {
         return err;
@@ -404,7 +348,7 @@ static scribe_error_t walk_reachable_object(hash_set *set, scribe_ctx *ctx, cons
  * Builds the full in-memory reachable set for list-objects --reachable. It
  * starts from refs/heads/main and walks parents, root trees, subtrees, and blobs.
  */
-static scribe_error_t build_reachable_set(scribe_ctx *ctx, hash_set *set) {
+static scribe_error_t build_reachable_set(scribe_ctx *ctx, scribe_hash_set *set) {
     /*
      * list-objects --reachable uses the same graph idea as fsck: start at
      * refs/heads/main, follow every parent commit, and follow every root tree
@@ -454,7 +398,7 @@ static scribe_error_t validate_format(const char *format) {
 
 typedef struct {
     scribe_ctx *ctx;
-    hash_set *reachable_set;
+    scribe_hash_set *reachable_set;
     int reachable_only;
     int type_mask;
     const char *format;
@@ -462,12 +406,13 @@ typedef struct {
 
 /*
  * Prints one object according to the already-validated list-objects format
- * string. `%C` performs the extra stat needed for compressed size.
+ * string. Packed entries pass compressed size from the index; loose entries pass
+ * the size collected while walking the object fanout directory.
  */
-static scribe_error_t print_formatted_object(list_objects_state *state, const uint8_t hash[SCRIBE_HASH_SIZE],
-                                             const scribe_object *obj) {
+static scribe_error_t print_formatted_object_meta(list_objects_state *state, const uint8_t hash[SCRIBE_HASH_SIZE],
+                                                  uint8_t type, size_t payload_len, size_t compressed_size) {
     const char *p;
-    const char *name = type_name(obj->type);
+    const char *name = type_name(type);
     char hex[SCRIBE_HEX_HASH_SIZE + 1];
 
     if (name == NULL) {
@@ -485,13 +430,8 @@ static scribe_error_t print_formatted_object(list_objects_state *state, const ui
         } else if (*p == 'T') {
             fputs(name, stdout);
         } else if (*p == 'S') {
-            printf("%zu", obj->payload_len);
+            printf("%zu", payload_len);
         } else if (*p == 'C') {
-            size_t compressed_size = 0;
-            scribe_error_t err = scribe_object_compressed_size(state->ctx, hash, &compressed_size);
-            if (err != SCRIBE_OK) {
-                return err;
-            }
             printf("%zu", compressed_size);
         } else if (*p == '%') {
             fputc('%', stdout);
@@ -504,16 +444,20 @@ static scribe_error_t print_formatted_object(list_objects_state *state, const ui
 }
 
 /*
- * Object-store iterator callback for list-objects. It applies reachable and
- * type filters, reads the object for verification/metadata, then prints it.
+ * Loose-object iterator callback for list-objects. Loose objects are still read
+ * through the normal object API so the payload length and hash verification
+ * remain exact for files in the write path.
  */
-static scribe_error_t list_object_visit(const uint8_t hash[SCRIBE_HASH_SIZE], void *user) {
+static scribe_error_t list_loose_object_visit(const uint8_t hash[SCRIBE_HASH_SIZE], const char *path, time_t mtime,
+                                              size_t compressed_size, void *user) {
     list_objects_state *state = (list_objects_state *)user;
     scribe_object obj;
     scribe_error_t err;
     int mask;
 
-    if (state->reachable_only && !hash_set_has(state->reachable_set, hash)) {
+    (void)path;
+    (void)mtime;
+    if (state->reachable_only && !scribe_hash_set_has(state->reachable_set, hash)) {
         return SCRIBE_OK;
     }
     err = scribe_object_read(state->ctx, hash, &obj);
@@ -529,9 +473,32 @@ static scribe_error_t list_object_visit(const uint8_t hash[SCRIBE_HASH_SIZE], vo
         scribe_object_free(&obj);
         return SCRIBE_OK;
     }
-    err = print_formatted_object(state, hash, &obj);
+    err = print_formatted_object_meta(state, hash, obj.type, obj.payload_len, compressed_size);
     scribe_object_free(&obj);
     return err;
+}
+
+/*
+ * Packed-object iterator callback for list-objects. The pack index already
+ * stores type, compressed size, and envelope size, so list output can avoid one
+ * packed-object read per record.
+ */
+static scribe_error_t list_packed_object_visit(const uint8_t hash[SCRIBE_HASH_SIZE], uint8_t type, size_t payload_len,
+                                               size_t compressed_size, void *user) {
+    list_objects_state *state = (list_objects_state *)user;
+    int mask;
+
+    if (state->reachable_only && !scribe_hash_set_has(state->reachable_set, hash)) {
+        return SCRIBE_OK;
+    }
+    mask = type_mask(type);
+    if (mask == 0) {
+        return scribe_set_error(SCRIBE_ECORRUPT, "unknown object type");
+    }
+    if (state->type_mask != 0 && (state->type_mask & mask) == 0) {
+        return SCRIBE_OK;
+    }
+    return print_formatted_object_meta(state, hash, type, payload_len, compressed_size);
 }
 
 /*
@@ -539,7 +506,7 @@ static scribe_error_t list_object_visit(const uint8_t hash[SCRIBE_HASH_SIZE], vo
  * graph set, then all modes iterate the object store through its iterator API.
  */
 scribe_error_t scribe_cli_list_objects(scribe_ctx *ctx, int type_mask_value, int reachable, const char *format) {
-    hash_set reachable_set;
+    scribe_hash_set reachable_set;
     list_objects_state state;
     scribe_error_t err;
 
@@ -551,7 +518,7 @@ scribe_error_t scribe_cli_list_objects(scribe_ctx *ctx, int type_mask_value, int
     if (reachable) {
         err = build_reachable_set(ctx, &reachable_set);
         if (err != SCRIBE_OK) {
-            hash_set_destroy(&reachable_set);
+            scribe_hash_set_destroy(&reachable_set);
             return err;
         }
     }
@@ -560,8 +527,11 @@ scribe_error_t scribe_cli_list_objects(scribe_ctx *ctx, int type_mask_value, int
     state.reachable_only = reachable;
     state.type_mask = type_mask_value;
     state.format = format;
-    err = scribe_object_iter(ctx, list_object_visit, &state);
-    hash_set_destroy(&reachable_set);
+    err = scribe_loose_object_iter(ctx, list_loose_object_visit, &state);
+    if (err == SCRIBE_OK) {
+        err = scribe_pack_entry_meta_iter(ctx, list_packed_object_visit, &state);
+    }
+    scribe_hash_set_destroy(&reachable_set);
     return err;
 }
 

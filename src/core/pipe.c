@@ -1,10 +1,11 @@
 /*
- * Pipe protocol v1 parser and commit driver.
+ * Pipe protocol v1/v2 parser and commit driver.
  *
- * `scribe commit-batch` reads a hybrid text/binary stream from stdin, turns each
- * BATCH frame into a scribe_change_batch, sends it through the configured SPSC
- * queue path, and writes an OK/ERR protocol response. The parser owns all heap
- * memory for a parsed batch and frees it after the commit attempt.
+ * `scribe-cli ingest --pipe` reads a hybrid text/binary stream from stdin,
+ * turns each BATCH frame into a scribe_change_batch, sends it through the
+ * configured SPSC queue path, and writes an OK/ERR protocol response. The
+ * parser owns all heap memory for a parsed batch and frees it after the commit
+ * attempt.
  */
 #include "core/internal.h"
 
@@ -175,6 +176,7 @@ static scribe_error_t parse_one_batch(FILE *in, char *first_line, scribe_change_
     char *line = NULL;
     size_t cap = 0;
     char *parts[5] = {0};
+    int protocol_version;
     size_t event_count = 0;
     size_t message_len = 0;
     size_t i;
@@ -191,7 +193,11 @@ static scribe_error_t parse_one_batch(FILE *in, char *first_line, scribe_change_
     if (split_tabs(first_line, parts, 3u) != 3u || strcmp(parts[0], "BATCH") != 0) {
         return scribe_set_error(SCRIBE_EPROTOCOL, "expected BATCH line");
     }
-    if (strcmp(parts[1], "1") != 0) {
+    if (strcmp(parts[1], "1") == 0) {
+        protocol_version = 1;
+    } else if (strcmp(parts[1], "2") == 0) {
+        protocol_version = 2;
+    } else {
         return scribe_set_error(SCRIBE_EPROTOCOL, "unsupported pipe protocol version '%s'", parts[1]);
     }
     if ((err = parse_size_field(parts[2], &event_count)) != SCRIBE_OK) {
@@ -279,17 +285,52 @@ static scribe_error_t parse_one_batch(FILE *in, char *first_line, scribe_change_
         size_t depth;
         size_t payload_len;
         size_t j;
+        int put_event;
         const char **path;
         if ((err = read_line(in, &line, &cap)) != SCRIBE_OK) {
             goto done;
         }
-        if (split_tabs(line, parts, 3u) != 3u || strcmp(parts[0], "EVENT") != 0) {
-            err = scribe_set_error(SCRIBE_EMALFORMED, "expected EVENT line");
-            goto done;
-        }
-        if ((err = parse_size_field(parts[1], &depth)) != SCRIBE_OK ||
-            (err = parse_size_field(parts[2], &payload_len)) != SCRIBE_OK) {
-            goto done;
+        if (protocol_version == 1) {
+            if (split_tabs(line, parts, 3u) != 3u || strcmp(parts[0], "EVENT") != 0) {
+                err = scribe_set_error(SCRIBE_EMALFORMED, "expected EVENT line");
+                goto done;
+            }
+            if ((err = parse_size_field(parts[1], &depth)) != SCRIBE_OK ||
+                (err = parse_size_field(parts[2], &payload_len)) != SCRIBE_OK) {
+                goto done;
+            }
+            put_event = payload_len != 0u;
+        } else {
+            size_t part_count = split_tabs(line, parts, 4u);
+
+            if (part_count < 3u || strcmp(parts[0], "EVENT") != 0) {
+                err = scribe_set_error(SCRIBE_EMALFORMED, "expected EVENT line");
+                goto done;
+            }
+            if (strcmp(parts[1], "put") == 0) {
+                if (part_count != 4u) {
+                    err = scribe_set_error(SCRIBE_EMALFORMED, "expected EVENT put line");
+                    goto done;
+                }
+                if ((err = parse_size_field(parts[2], &depth)) != SCRIBE_OK ||
+                    (err = parse_size_field(parts[3], &payload_len)) != SCRIBE_OK) {
+                    goto done;
+                }
+                put_event = 1;
+            } else if (strcmp(parts[1], "delete") == 0) {
+                if (part_count != 3u) {
+                    err = scribe_set_error(SCRIBE_EMALFORMED, "expected EVENT delete line");
+                    goto done;
+                }
+                if ((err = parse_size_field(parts[2], &depth)) != SCRIBE_OK) {
+                    goto done;
+                }
+                payload_len = 0u;
+                put_event = 0;
+            } else {
+                err = scribe_set_error(SCRIBE_EMALFORMED, "expected EVENT op put or delete");
+                goto done;
+            }
         }
         path = (const char **)calloc(depth, sizeof(char *));
         if (path == NULL) {
@@ -309,19 +350,21 @@ static scribe_error_t parse_one_batch(FILE *in, char *first_line, scribe_change_
             }
         }
         /*
-         * payload_len == 0 means tombstone/delete. Empty blobs are not
-         * representable in v1 because the public change event API uses
-         * payload == NULL and payload_len == 0 as the delete marker.
+         * In pipe v1, payload_len == 0 means tombstone/delete. Pipe v2 makes
+         * the operation explicit, so EVENT put ... 0 can represent an empty
+         * blob with a non-NULL payload pointer.
          */
-        if (payload_len != 0) {
-            uint8_t *payload = (uint8_t *)malloc(payload_len);
+        if (put_event) {
+            uint8_t *payload = (uint8_t *)malloc(payload_len == 0u ? 1u : payload_len);
             if (payload == NULL) {
                 err = scribe_set_error(SCRIBE_ENOMEM, "failed to allocate payload");
                 goto done;
             }
-            if ((err = read_exact(in, payload, payload_len)) != SCRIBE_OK) {
-                free(payload);
-                goto done;
+            if (payload_len != 0u) {
+                if ((err = read_exact(in, payload, payload_len)) != SCRIBE_OK) {
+                    free(payload);
+                    goto done;
+                }
             }
             ((scribe_change_event *)&batch->events[i])->payload = payload;
             ((scribe_change_event *)&batch->events[i])->payload_len = payload_len;
