@@ -10,7 +10,7 @@ extern "C" {
 
 #define SCRIBE_HASH_SIZE 32
 #define SCRIBE_HEX_HASH_SIZE 64
-#define SCRIBE_VERSION "1.1.2"
+#define SCRIBE_VERSION "2.0.0"
 
 typedef enum {
     SCRIBE_OK = 0,

@@ -482,7 +482,7 @@ should be short and scoped; include test evidence with behavior changes.
 
 ## Versioned releases
 
-Current release: scribe version 1.1.2.
+Current release: scribe version 2.0.0.
 
 Commit reviewed implementation and docs first. The wrapper requires clean
 version-managed files and no unrelated staged changes:
